@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# fry launcher shim for Linux/macOS. Put this on your PATH (chmod +x).
+exec python3 "${FRY_PY:-$(cd "$(dirname "$0")" && pwd)/fry.py}" "$@"

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.fry-backup.*
+config.json
+.fry/
+.DS_Store
