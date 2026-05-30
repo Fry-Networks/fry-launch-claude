@@ -42,7 +42,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
@@ -116,15 +116,30 @@ def wrap_for_windows(bin_path, args):
 def list_ollama_models():
     if shutil.which("ollama") is None:
         return []
-    proc = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-    if proc.returncode != 0:
-        return []
-    out = []
-    for ln in proc.stdout.splitlines()[1:]:
-        ln = ln.strip()
-        if ln:
-            out.append(ln.split()[0])
-    return out
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            proc = subprocess.run(
+                ["ollama", "list"], capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            if attempt < max_attempts:
+                warn(f"ollama list timed out (attempt {attempt}/{max_attempts}), retrying...")
+                time.sleep(2)
+                continue
+            return []
+        if proc.returncode == 0:
+            out = []
+            for ln in proc.stdout.splitlines()[1:]:
+                ln = ln.strip()
+                if ln:
+                    out.append(ln.split()[0])
+            return out
+        # non-zero exit — transient failure (server starting up, etc.)
+        if attempt < max_attempts:
+            warn(f"ollama list failed (attempt {attempt}/{max_attempts}), retrying...")
+            time.sleep(2)
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -193,7 +208,8 @@ def compile_ccr_config(cfg, override_default=None):
         providers_out.append(prov)
 
     if not providers_out:
-        die("no usable router providers (check secrets / models in config).")
+        die("no usable router providers — Ollama may be starting up or unavailable. "
+            "Check `ollama list`, or run `fry launch claude --native` to use subscription Claude now.")
 
     roles = dict(cfg.get("router", {}).get("roles", {}))
     if override_default:
