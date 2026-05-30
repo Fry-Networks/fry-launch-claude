@@ -1,30 +1,40 @@
 {
   "_comment": "fry config. Copy to ~/.fry/config.json (or $FRY_HOME/config.json) and edit the 'secret' fields. Secrets are op:// (1Password) or env:NAME references -- never plaintext. ROUTER mode gives a cross-provider /model list inside Claude Code (and feeds agent teams); NATIVE mode is one backend per session (the only way to use a Claude subscription).",
-
   "defaults": {
-    "claude": { "mode": "router", "provider": "anthropic" },
-    "codex":  { "mode": "native", "provider": "openai" }
+    "claude": {
+      "mode": "native",
+      "provider": "anthropic"
+    },
+    "codex": {
+      "mode": "native",
+      "provider": "openai"
+    }
   },
-
   "router": {
     "_note": "Compiled into ~/.claude-code-router/config.json. 'roles' map to claude-code-router's Router{} (which model serves which task class). 'default' is what a fresh session opens on; override per-launch with `fry launch claude --model <provider>,<model>`.",
     "config_path": "~/.claude-code-router/config.json",
     "port": 3456,
     "roles": {
-      "default":     "openrouter,anthropic/claude-sonnet-4.6",
-      "background":  "ollama,qwen3-coder:latest",
-      "think":       "openrouter,anthropic/claude-opus-4.6",
-      "longContext": "openrouter,google/gemini-2.5-pro"
+      "default": "ollama,qwen3-coder:latest"
     }
   },
-
   "agents": {
-    "claude": { "bin": ["claude", "claude.cmd", "claude.exe"] },
-    "codex":  { "bin": ["codex", "codex.cmd", "codex.exe"] }
+    "claude": {
+      "bin": [
+        "claude",
+        "claude.cmd",
+        "claude.exe"
+      ]
+    },
+    "codex": {
+      "bin": [
+        "codex",
+        "codex.cmd",
+        "codex.exe"
+      ]
+    }
   },
-
   "providers": {
-
     "anthropic": {
       "_note": "NATIVE: subscription login (leave secret null) or an injected ANTHROPIC_API_KEY. ROUTER: disabled by default because routing Claude through a proxy needs an API key (no subscription) and a known transformer. To enable Anthropic-direct in the router, set router.capable=true, set router.secret to your op:// Anthropic API key, and confirm the transformer your ccr build expects. By default, Claude models reach the router via OpenRouter instead (one key, well-supported).",
       "secret": null,
@@ -34,8 +44,14 @@
         "claude": {
           "requires_model": false,
           "requires_key": false,
-          "clear_env": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"],
-          "env": { "ANTHROPIC_MODEL": "{model}" },
+          "clear_env": [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS"
+          ],
+          "env": {
+            "ANTHROPIC_MODEL": "{model}"
+          },
           "secret_env": "ANTHROPIC_API_KEY"
         }
       },
@@ -43,21 +59,23 @@
         "capable": false,
         "api_base_url": "https://api.anthropic.com/v1/messages",
         "env_var": "ANTHROPIC_API_KEY",
-        "secret": "op://FryFarm/Anthropic/credential",
+        "secret": null,
         "transformer": null,
-        "models": ["claude-opus-4-6", "claude-sonnet-4-6"]
+        "models": [
+          "claude-opus-4-6",
+          "claude-sonnet-4-6"
+        ]
       }
     },
-
     "openrouter": {
-      "_note": "ROUTER: serves Claude + Gemini + anything OpenRouter offers, billed to OpenRouter credits -- one key. NATIVE: claude via OpenRouter Anthropic Skin; codex via custom OpenAI-compatible provider. Set secret to your OpenRouter key. Add/remove router.models freely (these are the strings that show up in /model).",
+      "_note": "FUTURE/INACTIVE by default (capable:false, no key, no 1Password). To activate: set providers.openrouter.router.capable=true and providers.openrouter.router.secret to a hardcoded key via \"literal:sk-or-...\" (no 1P) or \"op://Vault/Item/field\". Then add its models to router.roles if you want them as defaults. Until activated, fry routes Ollama only and needs no key.",
       "secret": "op://FryFarm/OpenRouter/credential",
       "default_model": "anthropic/claude-sonnet-4.6",
       "router": {
-        "capable": true,
+        "capable": false,
         "api_base_url": "https://openrouter.ai/api/v1/chat/completions",
         "env_var": "OPENROUTER_API_KEY",
-        "secret": "op://FryFarm/OpenRouter/credential",
+        "secret": null,
         "transformer": "openrouter",
         "models": [
           "anthropic/claude-opus-4.6",
@@ -83,19 +101,26 @@
         "codex": {
           "requires_model": true,
           "requires_key": true,
-          "env": { "OPENROUTER_API_KEY": "{api_key}" },
+          "env": {
+            "OPENROUTER_API_KEY": "{api_key}"
+          },
           "args": [
-            "-c", "model_provider=\"openrouter\"",
-            "-c", "model=\"{model}\"",
-            "-c", "model_providers.openrouter.name=\"OpenRouter\"",
-            "-c", "model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"",
-            "-c", "model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"",
-            "-c", "model_providers.openrouter.wire_api=\"chat\""
+            "-c",
+            "model_provider=\"openrouter\"",
+            "-c",
+            "model=\"{model}\"",
+            "-c",
+            "model_providers.openrouter.name=\"OpenRouter\"",
+            "-c",
+            "model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"",
+            "-c",
+            "model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"",
+            "-c",
+            "model_providers.openrouter.wire_api=\"chat\""
           ]
         }
       }
     },
-
     "ollama": {
       "_note": "Local Ollama. router.expand=true auto-includes EVERY model from `ollama list` in the /model list -- no need to enumerate them by hand. Codex only honors localhost for Ollama, which is fine here.",
       "secret": null,
@@ -117,7 +142,9 @@
         "claude": {
           "requires_model": true,
           "requires_key": false,
-          "clear_env": ["ANTHROPIC_CUSTOM_HEADERS"],
+          "clear_env": [
+            "ANTHROPIC_CUSTOM_HEADERS"
+          ],
           "env": {
             "ANTHROPIC_BASE_URL": "http://localhost:11434",
             "ANTHROPIC_AUTH_TOKEN": "ollama",
@@ -128,23 +155,33 @@
         "codex": {
           "requires_model": true,
           "requires_key": false,
-          "env": { "OLLAMA_API_KEY": "ollama" },
-          "args": ["-c", "model_provider=\"oss\"", "-c", "model=\"{model}\""]
+          "env": {
+            "OLLAMA_API_KEY": "ollama"
+          },
+          "args": [
+            "-c",
+            "model_provider=\"oss\"",
+            "-c",
+            "model=\"{model}\""
+          ]
         }
       }
     },
-
     "openai": {
       "_note": "OpenAI / Codex models. ROUTER: appears in Claude Code's /model as openai,<model>. NATIVE codex: native ChatGPT login (secret null) or injected OPENAI_API_KEY. Set router.secret to your OpenAI key to expose gpt-* in the router.",
       "secret": null,
       "default_model": null,
       "router": {
-        "capable": true,
+        "capable": false,
         "api_base_url": "https://api.openai.com/v1/chat/completions",
         "env_var": "OPENAI_API_KEY",
-        "secret": "op://FryFarm/OpenAI/credential",
+        "secret": null,
         "transformer": null,
-        "models": ["gpt-5.1", "gpt-5.1-mini", "gpt-5.1-codex"]
+        "models": [
+          "gpt-5.1",
+          "gpt-5.1-mini",
+          "gpt-5.1-codex"
+        ]
       },
       "native": {
         "codex": {
