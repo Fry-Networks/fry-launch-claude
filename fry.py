@@ -44,11 +44,72 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
 REDACT = "<redacted>"
+
+CREDENTIALS_PATH = FRY_HOME / "credentials.json"
+
+
+def load_credentials():
+    if not CREDENTIALS_PATH.exists():
+        return {}
+    try:
+        return json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_credentials(creds):
+    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CREDENTIALS_PATH.write_text(json.dumps(creds, indent=2), encoding="utf-8")
+    if os.name == "nt":
+        import subprocess
+        id_proc = subprocess.run(
+            ["powershell", "-Command",
+             "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name"],
+            capture_output=True, text=True,
+        )
+        win_user = id_proc.stdout.strip() if id_proc.returncode == 0 else os.environ.get("USERNAME")
+        subprocess.run(
+            ["icacls", str(CREDENTIALS_PATH), "/inheritance:r", "/grant:r",
+             f"{win_user}:(R,W)"],
+            capture_output=True,
+        )
+        acl_proc = subprocess.run(
+            ["icacls", str(CREDENTIALS_PATH)],
+            capture_output=True, text=True,
+        )
+        bad_aces = ["Everyone", "BUILTIN\\Users", "NT AUTHORITY\\Authenticated Users"]
+        unsafe = [ln for ln in acl_proc.stdout.splitlines()
+                  if any(ace in ln for ace in bad_aces)]
+        if unsafe:
+            warn(f"credentials file may have broad read ACLs: {unsafe}")
+        else:
+            print(f"fry: credentials file ACL restricted to {win_user}", file=sys.stderr)
+
+
+def resolve_local_secret(env_var, provider_name=None):
+    """Priority: 1) credentials.json by env_var or provider_name,
+    2) actual env var, 3) None."""
+    creds = load_credentials()
+    if env_var in creds:
+        return creds[env_var]
+    if provider_name and provider_name in creds:
+        return creds[provider_name]
+    return os.environ.get(env_var)
+
+
+def mask_input(prompt):
+    """Read password-style input without echoing. Falls back to plain input on error."""
+    try:
+        import getpass
+        return getpass.getpass(prompt)
+    except Exception:
+        return input(prompt)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -284,38 +345,29 @@ def router_provider_models(pname, prouter, expand_key=None):
             api_url = prouter.get("api_base_url", "")
             base = api_url.replace("/v1/chat/completions", "").rstrip("/")
 
-        if key and base:
-            candidates = set(models)
+        # Always include hardcoded models and fallback (unvalidated)
+        result = list(models) if models else list(fallback)
 
-            if prouter.get("expand"):
-                discovered = list_openai_compatible_models(base, api_key=key)
-                for m in discovered:
-                    if m in XAI_NON_CHAT_MODELS:
-                        continue
+        if key and base and prouter.get("expand"):
+            candidates = set()
+            discovered = list_openai_compatible_models(base, api_key=key)
+            for m in discovered:
+                if m in XAI_NON_CHAT_MODELS:
+                    continue
+                if m not in result:
                     candidates.add(m)
 
-            # Preserve config order, then alphabetise extras; cap at 10
-            ordered = []
-            seen = set()
-            for m in models:
-                if m in candidates and m not in seen:
-                    ordered.append(m)
-                    seen.add(m)
-            for m in sorted(candidates - seen):
-                ordered.append(m)
-            if len(ordered) > 10:
-                warn(f"router provider '{pname}': {len(ordered)} candidates, capping at 10.")
-                ordered = ordered[:10]
-
-            validated = []
-            for m in ordered:
+            for m in sorted(candidates):
+                if len(result) >= 10:
+                    warn(f"router provider '{pname}': capping at 10 models.")
+                    break
                 ok, status = validate_openai_compat_model(base, key, m)
                 if ok:
-                    validated.append(m)
+                    result.append(m)
                 else:
-                    warn(f"router provider '{pname}': model '{m}' failed validation ({status}); skipping.")
+                    warn(f"router provider '{pname}': discovered model '{m}' failed validation ({status}); skipping.")
 
-            return validated or fallback
+        return result
 
     return models or fallback
 
@@ -382,7 +434,8 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
 def compile_ccr_config(cfg, override_default=None):
     """
     Build a claude-code-router config dict from fry config.
-    Returns (ccr_dict, env_needed) where env_needed is a list of (env_var, secret_ref)
+    Returns (ccr_dict, env_needed) where env_needed is a list of dicts:
+    {"env_var": ..., "provider": ..., "source": ...}
     that must be exported before launch. API keys appear ONLY as $VAR placeholders.
     Providers whose secret cannot be resolved are dropped (with a warning).
     """
@@ -395,41 +448,59 @@ def compile_ccr_config(cfg, override_default=None):
         if not prouter or not prouter.get("capable"):
             continue
 
-        # Resolve auth first (needed for both model expansion and ccr config)
-        secret = prouter.get("secret")
         env_var = prouter.get("env_var")
         discover = prouter.get("discover")
         expand_key = None
 
         if discover == "xai":
-            key, source = discover_xai_key()
-            if key is None:
-                warn(f"router provider '{pname}': {source}; skipping.")
-                dropped.add(pname)
-                continue
-            if not env_var:
-                env_var = "XAI_API_KEY"
-            expand_key = key
-            api_key = "$" + env_var
-            env_needed.append((env_var, "literal:" + key))
-        elif secret is None:
-            # no real key needed (e.g. local ollama) -- use a literal placeholder value
-            api_key = prouter.get("literal_key", "not-needed")
+            env_var = env_var or "XAI_API_KEY"
+            key = resolve_local_secret(env_var, pname)
+            if key:
+                expand_key = key
+                api_key = "$" + env_var
+                env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
+            else:
+                key, source = discover_xai_key()
+                if key is None:
+                    warn(f"router provider '{pname}': no auth — run 'grok login' or set {env_var} or use 'fry credentials set {pname}'.")
+                    dropped.add(pname)
+                    continue
+                expand_key = key
+                api_key = "$" + env_var
+                if source == "grok-cli":
+                    env_needed.append({"env_var": env_var, "provider": pname, "source": "literal:" + key})
+                else:
+                    env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
         else:
             if not env_var:
-                warn(f"router provider '{pname}' has a secret but no env_var; skipping.")
-                dropped.add(pname)
-                continue
-            # verify the secret resolves now so we can drop the provider if it doesn't
-            try:
-                resolved = resolve_secret(secret)
-            except SystemExit:
-                warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
-                dropped.add(pname)
-                continue
-            expand_key = resolved
-            api_key = "$" + env_var
-            env_needed.append((env_var, secret))
+                # keyless provider (e.g. local ollama)
+                api_key = prouter.get("literal_key", "not-needed")
+            else:
+                val = resolve_local_secret(env_var, pname)
+                if val:
+                    expand_key = val
+                    api_key = "$" + env_var
+                    env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
+                else:
+                    secret = prouter.get("secret") or pcfg.get("secret")
+                    if secret and secret.startswith("op://"):
+                        warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
+                        dropped.add(pname)
+                        continue
+                    elif secret:
+                        try:
+                            resolved = resolve_secret(secret)
+                        except SystemExit:
+                            warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
+                            dropped.add(pname)
+                            continue
+                        expand_key = resolved
+                        api_key = "$" + env_var
+                        env_needed.append({"env_var": env_var, "provider": pname, "source": secret})
+                    else:
+                        warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
+                        dropped.add(pname)
+                        continue
 
         models = router_provider_models(pname, prouter, expand_key=expand_key)
         if not models:
@@ -455,11 +526,9 @@ def compile_ccr_config(cfg, override_default=None):
     if override_default:
         roles["default"] = override_default
     if "default" not in roles:
-        # fall back to first provider's first model
         first = providers_out[0]
         roles["default"] = f'{first["name"]},{first["models"][0]}'
 
-    # if any role points at a dropped provider, fix or fail
     for role, val in list(roles.items()):
         prov = val.split(",", 1)[0]
         if prov in dropped:
@@ -505,8 +574,8 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         print("MODE      : router (claude-code-router)")
         print(f"ccr binary: {ccr_bin or 'NOT FOUND -- install @musistudio/claude-code-router'}")
         print(f"ccr config: {ccr_config_path(cfg)}")
-        print(f"env export: {', '.join(v for v, _ in env_needed) or '(none)'}  "
-              f"(resolved at launch from op://, never shown)")
+        print(f"env export: {', '.join(e['env_var'] for e in env_needed) or '(none)'}  "
+              f"(resolved at launch from local credentials/env, never shown)")
         print("Router    :")
         for role, val in ccr_dict["Router"].items():
             print(f"            {role}: {val}")
@@ -527,8 +596,16 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     # resolve secrets into the child env (in memory only)
     env = os.environ.copy()
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
-    for env_var, secret in env_needed:
-        env[env_var] = resolve_secret(secret)
+    for entry in env_needed:
+        env_var = entry["env_var"]
+        provider_name = entry["provider"]
+        source = entry["source"]
+        if source == "local":
+            val = resolve_local_secret(env_var, provider_name)
+        else:
+            val = resolve_secret(source)
+        if val:
+            env[env_var] = val
 
     # Set default model for CC picker
     default_model = ccr_dict["Router"].get("default", "")
@@ -728,6 +805,41 @@ def cmd_router(cfg, args):
     return proc.returncode
 
 
+def cmd_credentials(cfg, args):
+    providers = cfg.get("providers", {})
+    pname = args.provider_name
+    if pname not in providers:
+        die(f"unknown provider '{pname}'.")
+    pcfg = providers[pname]
+    env_var = (pcfg.get("router") or {}).get("env_var")
+    if not env_var:
+        # fallback to native secret_env if router lacks env_var
+        for agent_name, mapping in (pcfg.get("native") or {}).items():
+            if isinstance(mapping, dict) and mapping.get("secret_env"):
+                env_var = mapping["secret_env"]
+                break
+    if not env_var:
+        die(f"provider '{pname}' has no env_var configured.")
+
+    if args.credentials_cmd == "set":
+        val = mask_input(f"Enter API key for {pname}: ")
+        if not val:
+            die("no key provided.")
+    elif args.credentials_cmd == "import-env":
+        val = os.environ.get(env_var)
+        if not val:
+            die(f"env var '{env_var}' is not set in this shell.")
+    else:
+        die(f"unknown credentials subcommand '{args.credentials_cmd}'.")
+
+    creds = load_credentials()
+    creds[env_var] = val
+    save_credentials(creds)
+    print(f"fry: stored credential for {pname} (env_var={env_var}, length={len(val)})",
+          file=sys.stderr)
+    return 0
+
+
 def cmd_doctor(cfg, _args):
     print(f"fry {VERSION}")
     print(f"config: {cfg['__path__']}\n")
@@ -736,6 +848,9 @@ def cmd_doctor(cfg, _args):
         print(f"  {tool:8s} : {path or 'NOT FOUND'}")
     print(f"\n  agent teams env: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="
           f"{os.environ.get('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', '(unset -- fry sets it for router launches)')}")
+    creds = load_credentials()
+    cred_status = f"{len(creds)} key(s) stored" if creds else "not present"
+    print(f"\n  credentials.json: {CREDENTIALS_PATH} ({cred_status})")
     print("\nproviders:")
     for name, p in cfg.get("providers", {}).items():
         r = p.get("router", {})
@@ -798,6 +913,13 @@ def build_parser():
                     help="router action; 'config' prints the compiled ccr config")
     pr.add_argument("--write", action="store_true", help="for 'config': write it to the ccr config path")
 
+    pc = sub.add_parser("credentials", help="manage local provider credentials")
+    pc_sub = pc.add_subparsers(dest="credentials_cmd", required=True)
+    pc_set = pc_sub.add_parser("set", help="store a provider key interactively")
+    pc_set.add_argument("provider_name", help="provider id, e.g. openai or xai")
+    pc_imp = pc_sub.add_parser("import-env", help="import a provider key from the current environment")
+    pc_imp.add_argument("provider_name", help="provider id, e.g. openai or xai")
+
     sub.add_parser("version", help="print fry version")
     return p
 
@@ -823,6 +945,7 @@ def main():
         "router": lambda: cmd_router(cfg, args),
         "doctor": lambda: cmd_doctor(cfg, args),
         "list": lambda: cmd_list(cfg, args),
+        "credentials": lambda: cmd_credentials(cfg, args),
     }[args.cmd]()
 
 

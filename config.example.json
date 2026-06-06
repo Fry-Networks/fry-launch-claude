@@ -46,6 +46,7 @@
     }
   },
   "providers": {
+    "_credentials_note": "Router provider API keys can also live in ~/.fry/credentials.json as {'OPENAI_API_KEY': 'sk-...'} instead of op:// references. Set via: fry credentials set <provider> or fry credentials import-env <provider>",
     "anthropic": {
       "_note": "NATIVE: subscription login (leave secret null) or an injected ANTHROPIC_API_KEY. ROUTER: disabled by default because routing Claude through a proxy needs an API key (no subscription) and a known transformer. To enable Anthropic-direct in the router, set router.capable=true, set router.secret to your op:// Anthropic API key, and confirm the transformer your ccr build expects. By default, Claude models reach the router via OpenRouter instead (one key, well-supported).",
       "secret": null,
@@ -221,11 +222,13 @@
         "env_var": "XAI_API_KEY",
         "secret": null,
         "transformer": null,
-        "models": [],
-        "models_fallback": [
-          "grok-3",
-          "grok-3-mini"
-        ]
+        "models": [
+          "grok-4.20-0309-non-reasoning",
+          "grok-4.20-0309-reasoning",
+          "grok-4.3",
+          "grok-build-0.1"
+        ],
+        "models_fallback": []
       },
       "native": {
         "default_model": "grok-3",
