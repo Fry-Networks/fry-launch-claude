@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
@@ -852,7 +852,7 @@ def cmd_router(cfg, args):
         if args.write:
             path = write_ccr_config(cfg, ccr_dict)
             print(f"wrote {path}")
-            print(f"(remember to export at launch: {', '.join(v for v,_ in env_needed) or '(none)'})")
+            print(f"(remember to export at launch: {', '.join(e['env_var'] for e in env_needed) or '(none)'})")
         else:
             print(json.dumps(ccr_dict, indent=2))
         return 0
