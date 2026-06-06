@@ -271,6 +271,54 @@ def discover_xai_key():
     return (None, "no auth — run 'grok login' or set XAI_API_KEY")
 
 
+def discover_openai_key():
+    """Discover OpenAI API key. Priority:
+    1. ~/.codex/auth.json — static OPENAI_API_KEY if present
+    2. ~/.codex/auth.json tokens.access_token — test against OpenAI API;
+       if it works (HTTP 200) treat as usable; if 403 "Missing scopes" it is
+       OAuth (ChatGPT login) and incompatible with router API-key path.
+    3. OPENAI_API_KEY env var (fallback)
+    4. Fail closed
+    Returns (key, source_label) or (None, reason).
+    Never prints token values. Never persists to disk."""
+    codex_path = Path.home() / ".codex" / "auth.json"
+    if codex_path.exists():
+        try:
+            data = json.loads(codex_path.read_text(encoding="utf-8"))
+            # 1. static API key (set via codex login --with-api-key)
+            static_key = data.get("OPENAI_API_KEY", "")
+            if isinstance(static_key, str) and static_key.startswith("sk-"):
+                return (static_key, "codex-cli")
+            # 2. OAuth access token — test compatibility
+            tokens = data.get("tokens", {})
+            if isinstance(tokens, dict):
+                jwt = tokens.get("access_token", "")
+                if isinstance(jwt, str) and jwt.startswith("eyJ"):
+                    try:
+                        req = urllib.request.Request(
+                            "https://api.openai.com/v1/models",
+                            headers={"Authorization": f"Bearer {jwt}"},
+                        )
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            if resp.status == 200:
+                                return (jwt, "codex-cli")
+                    except urllib.error.HTTPError as e:
+                        if e.code == 403:
+                            body = e.read().decode()[:200]
+                            if "Missing scopes" in body or "insufficient permissions" in body:
+                                return (None, "codex-cli-oauth-incompatible")
+                    except Exception:
+                        pass
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    env_key = os.environ.get("OPENAI_API_KEY")
+    if env_key:
+        return (env_key, "env")
+
+    return (None, "no auth — run 'codex login --with-api-key' or set OPENAI_API_KEY")
+
+
 # --------------------------------------------------------------------------- #
 # model validation
 # --------------------------------------------------------------------------- #
@@ -454,34 +502,41 @@ def compile_ccr_config(cfg, override_default=None):
 
         if discover == "xai":
             env_var = env_var or "XAI_API_KEY"
-            key = resolve_local_secret(env_var, pname)
-            if key:
-                expand_key = key
-                api_key = "$" + env_var
-                env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
+            # 1. live CLI auth source
+            key, source = discover_xai_key()
+            if not key:
+                # 2. credentials.json / env var
+                key = resolve_local_secret(env_var, pname)
+                if key:
+                    source = "local"
+            if not key:
+                warn(f"router provider '{pname}': no auth — run 'grok login' or set {env_var} or use 'fry credentials set {pname}'.")
+                dropped.add(pname)
+                continue
+            expand_key = key
+            api_key = "$" + env_var
+            if source == "grok-cli":
+                env_needed.append({"env_var": env_var, "provider": pname, "source": "literal:" + key})
             else:
-                key, source = discover_xai_key()
-                if key is None:
-                    warn(f"router provider '{pname}': no auth — run 'grok login' or set {env_var} or use 'fry credentials set {pname}'.")
-                    dropped.add(pname)
-                    continue
-                expand_key = key
-                api_key = "$" + env_var
-                if source == "grok-cli":
-                    env_needed.append({"env_var": env_var, "provider": pname, "source": "literal:" + key})
-                else:
-                    env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
+                env_needed.append({"env_var": env_var, "provider": pname, "source": source})
         else:
             if not env_var:
                 # keyless provider (e.g. local ollama)
                 api_key = prouter.get("literal_key", "not-needed")
             else:
-                val = resolve_local_secret(env_var, pname)
-                if val:
-                    expand_key = val
-                    api_key = "$" + env_var
-                    env_needed.append({"env_var": env_var, "provider": pname, "source": "local"})
-                else:
+                key = None
+                source = None
+                if pname == "openai":
+                    # 1. live CLI auth source
+                    key, source = discover_openai_key()
+                if not key and source == "codex-cli-oauth-incompatible":
+                    warn(f"router provider '{pname}': Codex CLI auth detected (ChatGPT OAuth) but incompatible with router API-key path. Run 'codex login --with-api-key' or set {env_var}.")
+                if not key:
+                    # 2. credentials.json / env var
+                    key = resolve_local_secret(env_var, pname)
+                    if key:
+                        source = "local"
+                if not key:
                     secret = prouter.get("secret") or pcfg.get("secret")
                     if secret and secret.startswith("op://"):
                         warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
@@ -494,13 +549,15 @@ def compile_ccr_config(cfg, override_default=None):
                             warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
                             dropped.add(pname)
                             continue
-                        expand_key = resolved
-                        api_key = "$" + env_var
-                        env_needed.append({"env_var": env_var, "provider": pname, "source": secret})
-                    else:
-                        warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
-                        dropped.add(pname)
-                        continue
+                        key = resolved
+                        source = secret
+                if not key:
+                    warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
+                    dropped.add(pname)
+                    continue
+                expand_key = key
+                api_key = "$" + env_var
+                env_needed.append({"env_var": env_var, "provider": pname, "source": source})
 
         models = router_provider_models(pname, prouter, expand_key=expand_key)
         if not models:
