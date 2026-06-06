@@ -380,7 +380,7 @@ def router_provider_models(pname, prouter, expand_key=None):
 
     if kind == "ollama" and prouter.get("expand"):
         for m in list_ollama_models():
-            if m not in models:
+            if m not in models and "cloud" not in m.split(":")[-1]:
                 models.append(m)
         return models or fallback
 
@@ -657,7 +657,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         env_var = entry["env_var"]
         provider_name = entry["provider"]
         source = entry["source"]
-        if source == "local":
+        if source in ("local", "env"):
             val = resolve_local_secret(env_var, provider_name)
         else:
             val = resolve_secret(source)
@@ -675,6 +675,32 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
 
     path = write_ccr_config(cfg, ccr_dict)
     inject_model_cache(ccr_dict)
+
+    # Restart CCR if running so it picks up fresh config and env vars
+    _ccr_kw = {}
+    if os.name == "nt":
+        _ccr_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        status_argv = wrap_for_windows(ccr_bin, ["status"])
+        status = subprocess.run(status_argv, capture_output=True, text=True, timeout=5, **_ccr_kw)
+        if status.returncode == 0 and "Running" in status.stdout:
+            restart_argv = wrap_for_windows(ccr_bin, ["restart"])
+            restart = subprocess.run(restart_argv, capture_output=True, text=True, timeout=15, **_ccr_kw)
+            if restart.returncode != 0:
+                warn(f"CCR restart failed: {restart.stderr or restart.stdout}")
+            else:
+                # poll until new server is ready (max 3 s)
+                for _ in range(6):
+                    time.sleep(0.5)
+                    try:
+                        chk = subprocess.run(status_argv, capture_output=True, text=True, timeout=5, **_ccr_kw)
+                        if chk.returncode == 0 and "Running" in chk.stdout:
+                            break
+                    except Exception:
+                        pass
+    except Exception as e:
+        warn(f"CCR status check failed: {e}")
+
     print(f"fry: wrote router config -> {path}", file=sys.stderr)
     print(f"fry: injected model cache into ~/.claude.json", file=sys.stderr)
     print(f"fry: switch models in-session with  /model <provider>,<model>   "
