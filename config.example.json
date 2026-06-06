@@ -179,7 +179,7 @@
       }
     },
     "openai": {
-      "_note": "OpenAI / Codex models. ROUTER: set router.capable=true and router.secret to your op:// OpenAI API key to expose gpt-* in the router. NATIVE codex: native ChatGPT login (secret null) or injected OPENAI_API_KEY.",
+      "_note": "OpenAI / Codex models. ROUTER: set router.capable=true and router.secret to your op:// OpenAI API key to expose gpt-* in the router. Only models that accept max_tokens (not max_completion_tokens) work through ccr's default OpenAI transformer. NATIVE codex: native ChatGPT login (secret null) or injected OPENAI_API_KEY.",
       "secret": null,
       "default_model": null,
       "router": {
@@ -189,9 +189,11 @@
         "secret": null,
         "transformer": null,
         "models": [
-          "gpt-5.1",
-          "gpt-5.1-mini",
-          "gpt-5.1-codex"
+          "gpt-4.1",
+          "gpt-4.1-mini",
+          "gpt-4.1-nano",
+          "gpt-4o",
+          "gpt-4o-mini"
         ]
       },
       "native": {

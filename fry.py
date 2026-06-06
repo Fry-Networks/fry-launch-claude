@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
@@ -211,29 +211,113 @@ def discover_xai_key():
 
 
 # --------------------------------------------------------------------------- #
+# model validation
+# --------------------------------------------------------------------------- #
+XAI_NON_CHAT_MODELS = {
+    "grok-imagine-image",
+    "grok-imagine-image-quality",
+    "grok-imagine-video",
+    "grok-imagine-video-1.5-preview",
+}
+
+
+def validate_openai_compat_model(base_url, api_key, model_id, timeout=15):
+    """Send a minimal chat-completion request (max_tokens=100, as ccr does by default).
+    Returns (ok, status_or_error)."""
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    payload = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "Reply exactly PONG"}],
+        "max_tokens": 100,
+    }).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode()
+            data = json.loads(body)
+            if data.get("error"):
+                err = data["error"]
+                msg = err.get("message", "")[:120]
+                return False, f"provider_error:{msg}"
+            return True, f"http_{resp.status}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)[:120]
+        except Exception:
+            msg = body[:120]
+        return False, f"http_{e.code}:{msg}"
+    except Exception as e:
+        return False, f"exception:{type(e).__name__}:{str(e)[:120]}"
+
+
+# --------------------------------------------------------------------------- #
 # ROUTER mode (claude-code-router)
 # --------------------------------------------------------------------------- #
 FRY_MODEL_MARKER = " (router)"
 
 
 def router_provider_models(pname, prouter, expand_key=None):
-    """Return the model list for a router provider, expanding dynamically."""
+    """Return the model list for a router provider, expanding dynamically.
+    For openai_compat providers every candidate is smoke-tested via a
+    minimal chat-completion request so only callable models reach the picker."""
     models = list(prouter.get("models", []))
-    if prouter.get("expand"):
-        if prouter.get("kind") == "ollama":
-            for m in list_ollama_models():
-                if m not in models:
-                    models.append(m)
-        elif prouter.get("kind") == "openai_compat":
-            key = expand_key
-            if key is None and prouter.get("discover") == "xai":
-                key, _ = discover_xai_key()
-            base = prouter.get("expand_base_url")
-            if base and key:
-                for m in list_openai_compatible_models(base, api_key=key):
-                    if m not in models:
-                        models.append(m)
-    return models or prouter.get("models_fallback", [])
+    fallback = prouter.get("models_fallback", [])
+    kind = prouter.get("kind")
+
+    if kind == "ollama" and prouter.get("expand"):
+        for m in list_ollama_models():
+            if m not in models:
+                models.append(m)
+        return models or fallback
+
+    if kind == "openai_compat":
+        key = expand_key
+        if key is None and prouter.get("discover") == "xai":
+            key, _ = discover_xai_key()
+        base = prouter.get("expand_base_url") or ""
+        if not base:
+            api_url = prouter.get("api_base_url", "")
+            base = api_url.replace("/v1/chat/completions", "").rstrip("/")
+
+        if key and base:
+            candidates = set(models)
+
+            if prouter.get("expand"):
+                discovered = list_openai_compatible_models(base, api_key=key)
+                for m in discovered:
+                    if m in XAI_NON_CHAT_MODELS:
+                        continue
+                    candidates.add(m)
+
+            # Preserve config order, then alphabetise extras; cap at 10
+            ordered = []
+            seen = set()
+            for m in models:
+                if m in candidates and m not in seen:
+                    ordered.append(m)
+                    seen.add(m)
+            for m in sorted(candidates - seen):
+                ordered.append(m)
+            if len(ordered) > 10:
+                warn(f"router provider '{pname}': {len(ordered)} candidates, capping at 10.")
+                ordered = ordered[:10]
+
+            validated = []
+            for m in ordered:
+                ok, status = validate_openai_compat_model(base, key, m)
+                if ok:
+                    validated.append(m)
+                else:
+                    warn(f"router provider '{pname}': model '{m}' failed validation ({status}); skipping.")
+
+            return validated or fallback
+
+    return models or fallback
 
 
 def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
