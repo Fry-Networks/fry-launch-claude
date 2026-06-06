@@ -8,6 +8,10 @@
     "codex": {
       "mode": "native",
       "provider": "openai"
+    },
+    "grok": {
+      "mode": "native",
+      "provider": "xai"
     }
   },
   "router": {
@@ -31,6 +35,13 @@
         "codex",
         "codex.cmd",
         "codex.exe"
+      ]
+    },
+    "grok": {
+      "bin": [
+        "grok",
+        "grok.cmd",
+        "grok.exe"
       ]
     }
   },
@@ -168,7 +179,7 @@
       }
     },
     "openai": {
-      "_note": "OpenAI / Codex models. ROUTER: appears in Claude Code's /model as openai,<model>. NATIVE codex: native ChatGPT login (secret null) or injected OPENAI_API_KEY. Set router.secret to your OpenAI key to expose gpt-* in the router.",
+      "_note": "OpenAI / Codex models. ROUTER: set router.capable=true and router.secret to your op:// OpenAI API key to expose gpt-* in the router. NATIVE codex: native ChatGPT login (secret null) or injected OPENAI_API_KEY.",
       "secret": null,
       "default_model": null,
       "router": {
@@ -190,6 +201,49 @@
           "clear_env": [],
           "env": {},
           "secret_env": "OPENAI_API_KEY"
+        }
+      }
+    },
+    "xai": {
+      "_note": "xAI/Grok. Router: JWT from ~/.grok/auth.json (~6h expiry), fallback XAI_API_KEY env. Native: requires XAI_API_KEY env var. Set router.capable=true to enable.",
+      "secret": "env:XAI_API_KEY",
+      "base_url": "https://api.x.ai",
+      "default_model": "grok-3",
+      "router": {
+        "capable": false,
+        "kind": "openai_compat",
+        "expand": true,
+        "expand_base_url": "https://api.x.ai",
+        "discover": "xai",
+        "api_base_url": "https://api.x.ai/v1/chat/completions",
+        "env_var": "XAI_API_KEY",
+        "secret": null,
+        "transformer": null,
+        "models": [],
+        "models_fallback": [
+          "grok-3",
+          "grok-3-mini"
+        ]
+      },
+      "native": {
+        "default_model": "grok-3",
+        "claude": {
+          "requires_model": true,
+          "requires_key": true,
+          "clear_env": [
+            "ANTHROPIC_CUSTOM_HEADERS"
+          ],
+          "env": {
+            "ANTHROPIC_BASE_URL": "https://api.x.ai",
+            "ANTHROPIC_AUTH_TOKEN": "{api_key}",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_MODEL": "{model}"
+          }
+        },
+        "grok": {
+          "requires_model": false,
+          "requires_key": false,
+          "env": {}
         }
       }
     }

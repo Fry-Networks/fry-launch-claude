@@ -40,9 +40,11 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
@@ -142,17 +144,155 @@ def list_ollama_models():
     return []
 
 
+def list_openai_compatible_models(base_url, api_key=None, timeout=10, max_attempts=3):
+    """Query OpenAI-compatible /v1/models endpoint. Returns list of model ID strings.
+    Retry logic matches list_ollama_models() pattern. Uses urllib (stdlib only).
+    Never logs/prints the api_key."""
+    url = base_url.rstrip("/") + "/v1/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+            return [m["id"] for m in data.get("data", []) if "id" in m]
+        except Exception:
+            if attempt < max_attempts:
+                warn(f"{base_url} /v1/models failed (attempt {attempt}/{max_attempts}), retrying...")
+                time.sleep(2)
+    warn(f"could not list models from {base_url}")
+    return []
+
+
+def discover_xai_key():
+    """Discover xAI API key. Priority:
+    1. ~/.grok/auth.json — find JWT-shaped field, check expiry, test against xAI API
+    2. XAI_API_KEY env var (fallback)
+    3. Fail closed
+    Returns (key, source_label) or (None, reason).
+    Never prints token values. Never persists to disk."""
+    grok_path = Path.home() / ".grok" / "auth.json"
+    if grok_path.exists():
+        try:
+            data = json.loads(grok_path.read_text(encoding="utf-8"))
+            for _oidc_key, entry in data.items():
+                if not isinstance(entry, dict):
+                    continue
+                jwt = entry.get("key", "")
+                if not isinstance(jwt, str) or not jwt.startswith("eyJ"):
+                    continue
+                expires_at = entry.get("expires_at", "")
+                if isinstance(expires_at, str) and expires_at:
+                    exp_cmp = expires_at.rstrip("Z").split(".")[0]
+                    now_cmp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                    if exp_cmp < now_cmp:
+                        warn("grok JWT expired; skipping.")
+                        continue
+                try:
+                    req = urllib.request.Request(
+                        "https://api.x.ai/v1/models",
+                        headers={"Authorization": f"Bearer {jwt}"},
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        if resp.status == 200:
+                            return (jwt, "grok-cli")
+                except Exception:
+                    pass
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    env_key = os.environ.get("XAI_API_KEY")
+    if env_key:
+        return (env_key, "env")
+
+    return (None, "no auth — run 'grok login' or set XAI_API_KEY")
+
+
 # --------------------------------------------------------------------------- #
 # ROUTER mode (claude-code-router)
 # --------------------------------------------------------------------------- #
-def router_provider_models(pname, prouter):
-    """Return the model list for a router provider, expanding ollama live."""
+FRY_MODEL_MARKER = " (router)"
+
+
+def router_provider_models(pname, prouter, expand_key=None):
+    """Return the model list for a router provider, expanding dynamically."""
     models = list(prouter.get("models", []))
-    if prouter.get("expand") and prouter.get("kind") == "ollama":
-        for m in list_ollama_models():
-            if m not in models:
-                models.append(m)
-    return models
+    if prouter.get("expand"):
+        if prouter.get("kind") == "ollama":
+            for m in list_ollama_models():
+                if m not in models:
+                    models.append(m)
+        elif prouter.get("kind") == "openai_compat":
+            key = expand_key
+            if key is None and prouter.get("discover") == "xai":
+                key, _ = discover_xai_key()
+            base = prouter.get("expand_base_url")
+            if base and key:
+                for m in list_openai_compatible_models(base, api_key=key):
+                    if m not in models:
+                        models.append(m)
+    return models or prouter.get("models_fallback", [])
+
+
+def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
+    """Write ccr provider models to ~/.claude.json additionalModelOptionsCache.
+    Preserves non-fry entries (no FRY_MODEL_MARKER in description).
+    Removes stale fry entries, replaces with current.
+    NO-OP in dry-run mode — prints preview only."""
+    if claude_json_path is None:
+        claude_json_path = Path.home() / ".claude.json"
+    else:
+        claude_json_path = Path(claude_json_path)
+
+    new_entries = []
+    for prov in ccr_dict.get("Providers", []):
+        pname = prov["name"]
+        for model in prov.get("models", []):
+            value = f"{pname},{model}"
+            new_entries.append({
+                "value": value,
+                "label": model,
+                "description": f"{pname}{FRY_MODEL_MARKER}",
+            })
+
+    if dry_run:
+        print(f"\n--- Model cache preview ({len(new_entries)} entries) ---")
+        for e in new_entries[:10]:
+            print(f"  {e['value']}")
+        if len(new_entries) > 10:
+            print(f"  ... and {len(new_entries) - 10} more")
+        print("(dry run: ~/.claude.json NOT modified)\n")
+        return
+
+    if not claude_json_path.exists():
+        warn(f"{claude_json_path} not found; creating minimal file.")
+        claude_data = {}
+    else:
+        claude_data = json.loads(claude_json_path.read_text(encoding="utf-8"))
+
+    old_cache = claude_data.get("additionalModelOptionsCache", [])
+    kept = [e for e in old_cache
+            if isinstance(e, dict)
+            and not e.get("description", "").endswith(FRY_MODEL_MARKER)]
+
+    seen = set()
+    merged = []
+    for e in kept + new_entries:
+        val = e.get("value", "")
+        if val and val not in seen:
+            seen.add(val)
+            merged.append(e)
+
+    for e in merged:
+        if not all(k in e for k in ("value", "label", "description")):
+            die(f"invalid model cache entry (missing keys): {e}")
+
+    claude_data["additionalModelOptionsCache"] = merged
+    claude_json_path.write_text(json.dumps(claude_data, indent=2), encoding="utf-8")
+    print(f"fry: injected {len(new_entries)} router models into {claude_json_path} "
+          f"({len(kept)} preserved, {len(merged)} total)", file=sys.stderr)
 
 
 def compile_ccr_config(cfg, override_default=None):
@@ -171,15 +311,24 @@ def compile_ccr_config(cfg, override_default=None):
         if not prouter or not prouter.get("capable"):
             continue
 
-        models = router_provider_models(pname, prouter)
-        if not models:
-            warn(f"router provider '{pname}' has no models; skipping.")
-            dropped.add(pname)
-            continue
-
+        # Resolve auth first (needed for both model expansion and ccr config)
         secret = prouter.get("secret")
         env_var = prouter.get("env_var")
-        if secret is None:
+        discover = prouter.get("discover")
+        expand_key = None
+
+        if discover == "xai":
+            key, source = discover_xai_key()
+            if key is None:
+                warn(f"router provider '{pname}': {source}; skipping.")
+                dropped.add(pname)
+                continue
+            if not env_var:
+                env_var = "XAI_API_KEY"
+            expand_key = key
+            api_key = "$" + env_var
+            env_needed.append((env_var, "literal:" + key))
+        elif secret is None:
             # no real key needed (e.g. local ollama) -- use a literal placeholder value
             api_key = prouter.get("literal_key", "not-needed")
         else:
@@ -189,13 +338,20 @@ def compile_ccr_config(cfg, override_default=None):
                 continue
             # verify the secret resolves now so we can drop the provider if it doesn't
             try:
-                _ = resolve_secret(secret)
+                resolved = resolve_secret(secret)
             except SystemExit:
                 warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
                 dropped.add(pname)
                 continue
+            expand_key = resolved
             api_key = "$" + env_var
             env_needed.append((env_var, secret))
+
+        models = router_provider_models(pname, prouter, expand_key=expand_key)
+        if not models:
+            warn(f"router provider '{pname}' has no models; skipping.")
+            dropped.add(pname)
+            continue
 
         prov = {
             "name": pname,
@@ -275,7 +431,8 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             print(f"            {prov['name']}: {len(prov['models'])} models "
                   f"(api_key={prov['api_key']})")
         print(f"command   : ccr code {' '.join(passthrough)}".rstrip())
-        print("\n(dry run: ccr config NOT written, nothing launched)")
+        inject_model_cache(ccr_dict, dry_run=True)
+        print("(dry run: ccr config NOT written, nothing launched)")
         return 0
 
     if ccr_bin is None:
@@ -289,8 +446,19 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     for env_var, secret in env_needed:
         env[env_var] = resolve_secret(secret)
 
+    # Set default model for CC picker
+    default_model = ccr_dict["Router"].get("default", "")
+    if default_model:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = default_model
+        if "," in default_model:
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = (
+                default_model.split(",", 1)[1] + " (default)")
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = "Default router model"
+
     path = write_ccr_config(cfg, ccr_dict)
+    inject_model_cache(ccr_dict)
     print(f"fry: wrote router config -> {path}", file=sys.stderr)
+    print(f"fry: injected model cache into ~/.claude.json", file=sys.stderr)
     print(f"fry: switch models in-session with  /model <provider>,<model>   "
           f"(run `fry models` for the list)", file=sys.stderr)
 
