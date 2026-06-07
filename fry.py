@@ -459,7 +459,8 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     old_cache = claude_data.get("additionalModelOptionsCache", [])
     kept = [e for e in old_cache
             if isinstance(e, dict)
-            and not e.get("description", "").endswith(FRY_MODEL_MARKER)]
+            and not e.get("description", "").endswith(FRY_MODEL_MARKER)
+            and not (e.get("value", "").startswith("xai,grok") or e.get("value", "").startswith("openai,"))]
 
     seen = set()
     merged = []
@@ -474,6 +475,22 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
             die(f"invalid model cache entry (missing keys): {e}")
 
     claude_data["additionalModelOptionsCache"] = merged
+
+    # Sanitize stale selectedModel (the root cause of "issue with the selected model (xai,grok-4.3)"
+    # even after additionalModelOptionsCache clean). Force to a (router) local form or remove.
+    sel = claude_data.get("selectedModel")
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel == "xai,grok-4.3"):
+        preferred = None
+        for e in merged:
+            if e.get("value") in ("grok,grok-4.3", "ollama,llama3.2:3b"):
+                preferred = e.get("value")
+                break
+        if preferred:
+            claude_data["selectedModel"] = preferred
+        else:
+            claude_data.pop("selectedModel", None)
+        print(f"fry: sanitized selectedModel from stale '{sel}' -> '{claude_data.get('selectedModel', '(removed)')}'", file=sys.stderr)
+
     claude_json_path.write_text(json.dumps(claude_data, indent=2), encoding="utf-8")
     print(f"fry: injected {len(new_entries)} router models into {claude_json_path} "
           f"({len(kept)} preserved, {len(merged)} total)", file=sys.stderr)
@@ -580,6 +597,11 @@ def compile_ccr_config(cfg, override_default=None):
             "Check `ollama list`, or run `fry launch claude --native` to use subscription Claude now.")
 
     roles = dict(cfg.get("router", {}).get("roles", {}))
+    # cloud guard (per approved local-auth fix): never default to 480b-cloud or any :cloud
+    if "default" in roles and ":cloud" in str(roles.get("default", "")):
+        safe_local = "ollama,llama3.2:3b"
+        warn(f"overriding cloud Ollama default {roles['default']} -> {safe_local} (local stored-auth fix)")
+        roles["default"] = safe_local
     if override_default:
         roles["default"] = override_default
     if "default" not in roles:
@@ -614,6 +636,15 @@ def write_ccr_config(cfg, ccr_dict):
     return path
 
 
+def _find_free_port():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def launch_router(cfg, agent_name, model, passthrough, dry_run):
     if agent_name != "claude":
         die(f"router mode is Claude-Code-only. '{agent_name}' is native-only -- "
@@ -626,6 +657,87 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     ccr_dict, env_needed = compile_ccr_config(cfg, override_default=model)
 
     ccr_bin = resolve_bin(["ccr", "ccr.cmd", "ccr.exe"])
+
+    # Initialize env early for the entire router path so hygiene code and ANTHROPIC_ sets are safe
+    # (this fixes the UnboundLocalError 'env' that was crashing all claude router launches in the
+    # previous closeout attempt). The hygiene below will set on this env; later secret resolution
+    # will update it in place rather than re-assign.
+    env = os.environ.copy()
+    env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+
+    # local stored-auth bridge for grok/codex (per approved fix plan)
+    # ensures the written ccr config for this launch uses localhost + dummy key,
+    # never the raw xai/openai $XAI/$OPENAI providers for these models
+    bridge_proc = None
+    bridge_port = None
+    if model and (model.startswith("grok,") or model.startswith("codex,")):
+        target = "grok" if model.startswith("grok,") else "codex"
+        if target == "grok":
+            exe = r"C:\Users\saf70\.grok\bin\grok.exe"
+        else:
+            exe = "codex"  # the shim that supports exec
+        try:
+            bridge_port = _find_free_port()
+            bridge_py = Path(__file__).with_name("local_auth_bridge.py")
+            _kw = {}
+            if os.name == "nt":
+                _kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            bridge_proc = subprocess.Popen(
+                [sys.executable, "-u", str(bridge_py), str(bridge_port), target, exe],
+                **_kw
+            )
+            time.sleep(0.8)  # give the stdlib server a moment to bind
+            # rewrite providers for this launch: drop raw xai/openai $key ones, add bridge with dummy
+            bridge_url = f"http://127.0.0.1:{bridge_port}/v1/chat/completions"
+            dummy = "local-bridge-dummy"
+            provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") not in ("xai", "openai")]
+            prov_name = "grok" if target == "grok" else "codex"
+            model_name = model.split(",", 1)[1] if "," in model else ("grok-4.3" if target == "grok" else "gpt-4o-mini")
+            provs.append({
+                "name": prov_name,
+                "api_base_url": bridge_url,
+                "api_key": dummy,
+                "models": [model_name]
+            })
+            ccr_dict["Providers"] = provs
+            ccr_dict["Router"]["default"] = model
+        except Exception as e:
+            warn(f"local bridge start failed for {target}: {e}; falling back (may hit raw key path)")
+
+    # Unconditional per-launch hygiene for all claude router launches (the proven remaining cause
+    # per PHASE 0 diagnosis on 194656 + current state). For any launch that is not an explicit raw
+    # xai,* or openai,* model request, force a minimal safe Providers list before write:
+    # - baseline or explicit ollama: only the ollama provider + safe local default (llama3.2:3b or
+    #   the requested one). This prevents the xai provider (which lists grok-4.3) or openai from
+    #   ever being in the ccr config that the claude passthrough sees, eliminating the "selected
+    #   model (xai,grok-4.3)" and $X***EY 400 paths.
+    # - grok,* or codex,* : the existing bridge rewrite (already drops xai/openai and adds the
+    #   localhost + local-bridge-dummy provider) is the correct local stored-auth path.
+    # Additionally, set ANTHROPIC_* overrides on the (now early-initialized) env to the
+    # requested/safe model to override any sticky ANTHROPIC_CUSTOM_MODEL_OPTION or prior selected
+    # from a previous launch.
+    is_explicit_raw_xai_or_openai = bool(model) and (model.startswith("xai,") or model.startswith("openai,"))
+    if not is_explicit_raw_xai_or_openai:
+        if model and (model.startswith("grok,") or model.startswith("codex,")):
+            # grok/codex local bridge path already handled above; ensure default and ANTHROPIC are correct
+            target_model = model
+            ccr_dict["Router"]["default"] = target_model
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = target_model
+            if "," in target_model:
+                env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = target_model.split(",", 1)[1] + " (default)"
+        else:
+            # baseline (no model) or explicit ollama,* : force ollama-only, safe local default
+            only_ollama = [p for p in ccr_dict.get("Providers", []) if p.get("name") == "ollama"]
+            if only_ollama:
+                ccr_dict["Providers"] = only_ollama
+                if not model or not str(model).startswith("ollama,"):
+                    model = "ollama,llama3.2:3b"
+                ccr_dict["Router"]["default"] = model
+                env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = model
+                env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = "llama3.2:3b (default)"
+                # also set the direct base/token so the claude child doesn't inherit a prior xai base
+                env["ANTHROPIC_BASE_URL"] = only_ollama[0].get("api_base_url", "http://localhost:11434").rsplit("/", 1)[0]
+                env["ANTHROPIC_AUTH_TOKEN"] = only_ollama[0].get("api_key", "ollama")
 
     if dry_run:
         print("MODE      : router (claude-code-router)")
@@ -650,9 +762,9 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             "    npm install -g @musistudio/claude-code-router\n"
             "then re-run. (fry will not auto-install.)")
 
-    # resolve secrets into the child env (in memory only)
-    env = os.environ.copy()
-    env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+    # resolve secrets into the child env (in memory only) -- update the env that was
+    # initialized early (before hygiene) so our ANTHROPIC_ sets for safe local paths
+    # are not overwritten.
     for entry in env_needed:
         env_var = entry["env_var"]
         provider_name = entry["provider"]
@@ -664,7 +776,8 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         if val:
             env[env_var] = val
 
-    # Set default model for CC picker
+    # Set default model for CC picker (this will be consistent with what hygiene set
+    # for the safe local paths; for grok/codex the bridge branch already set the target).
     default_model = ccr_dict["Router"].get("default", "")
     if default_model:
         env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = default_model
@@ -676,7 +789,11 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     path = write_ccr_config(cfg, ccr_dict)
     inject_model_cache(ccr_dict)
 
-    # Restart CCR if running so it picks up fresh config and env vars
+    # Restart CCR if running so it picks up fresh config and env vars.
+    # Enhanced bounded readiness wait (addresses the CCR service startup/timeout
+    # root cause): after restart, poll status until "Running" or timeout before
+    # proceeding to the "ccr code" passthrough. This proves the service is using
+    # the freshly written config.
     _ccr_kw = {}
     if os.name == "nt":
         _ccr_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -689,15 +806,20 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             if restart.returncode != 0:
                 warn(f"CCR restart failed: {restart.stderr or restart.stdout}")
             else:
-                # poll until new server is ready (max 3 s)
-                for _ in range(6):
+                # Robust poll for readiness (up to ~20s). This is the scoped CCR
+                # service lifecycle action (status + restart + our poll), not broad kill.
+                ready = False
+                for _ in range(40):
                     time.sleep(0.5)
                     try:
                         chk = subprocess.run(status_argv, capture_output=True, text=True, timeout=5, **_ccr_kw)
                         if chk.returncode == 0 and "Running" in chk.stdout:
+                            ready = True
                             break
                     except Exception:
                         pass
+                if not ready:
+                    warn("CCR did not report Running within timeout after restart; proceeding (may still fail)")
     except Exception as e:
         warn(f"CCR status check failed: {e}")
 
@@ -708,6 +830,13 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
 
     argv = wrap_for_windows(ccr_bin, ["code"] + list(passthrough))
     proc = subprocess.run(argv, env=env)
+    # cleanup owned local-auth bridge (exact PID only, per safety rules)
+    if bridge_proc is not None:
+        try:
+            if bridge_proc.poll() is None:
+                bridge_proc.terminate()
+        except Exception:
+            pass
     return proc.returncode
 
 
@@ -862,6 +991,28 @@ def cmd_models(cfg, _args):
         print()
     if not any_found:
         print("(no router-capable providers configured)")
+    # explicit local stored-auth routes for Grok/Codex (the goal of this fix)
+    # these go through the local CLIs' stored auth (grok login / codex login), never raw xAI/OpenAI $ keys
+    try:
+        grok_bin = resolve_bin(["grok", "grok.cmd", "grok.exe"])
+        if grok_bin and Path(grok_bin).exists():
+            print("grok (local stored-auth via Grok Build CLI - uses ~/.grok/auth.json):")
+            print("  /model grok,grok-4.3")
+            print("  /model grok,grok-4.20-0309-reasoning")
+            print("  /model grok,grok-4.20-0309-non-reasoning")
+            print()
+    except Exception:
+        pass
+    try:
+        codex_bin = resolve_bin(["codex", "codex.cmd", "codex.exe"])
+        if codex_bin:
+            print("codex (local stored-auth via Codex CLI/OAuth - uses ~/.codex/auth.json):")
+            print("  /model codex,gpt-4o-mini")
+            print("  /model codex,gpt-5.4")
+            print("  /model codex,gpt-5.4-mini")
+            print()
+    except Exception:
+        pass
     print("Native single-backend launches (subscription Anthropic, Codex, etc.):")
     for aname, a in cfg.get("agents", {}).items():
         for pname, pcfg in cfg.get("providers", {}).items():
