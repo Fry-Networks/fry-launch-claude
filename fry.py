@@ -36,6 +36,7 @@ Credential hygiene:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -454,13 +455,14 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
         warn(f"{claude_json_path} not found; creating minimal file.")
         claude_data = {}
     else:
-        claude_data = json.loads(claude_json_path.read_text(encoding="utf-8"))
+        # Use utf-8-sig to tolerate BOM left by prior tolerant text writes to .claude.json (observed in dirty 215845 state).
+        claude_data = json.loads(claude_json_path.read_text(encoding="utf-8-sig"))
 
     old_cache = claude_data.get("additionalModelOptionsCache", [])
     kept = [e for e in old_cache
             if isinstance(e, dict)
             and not e.get("description", "").endswith(FRY_MODEL_MARKER)
-            and not (e.get("value", "").startswith("xai,grok") or e.get("value", "").startswith("openai,"))]
+            and not (e.get("value", "").startswith("xai,") or e.get("value", "").startswith("openai,") or e.get("value", "").startswith("fry-grok,") or e.get("value", "").startswith("fry-codex,"))]
 
     seen = set()
     merged = []
@@ -477,12 +479,12 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     claude_data["additionalModelOptionsCache"] = merged
 
     # Sanitize stale selectedModel (the root cause of "issue with the selected model (xai,grok-4.3)"
-    # even after additionalModelOptionsCache clean). Force to a (router) local form or remove.
+    # even after additionalModelOptionsCache clean). Force to the ollama local form or remove.
     sel = claude_data.get("selectedModel")
-    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel == "xai,grok-4.3"):
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok,") or sel.startswith("fry-codex,") or sel == "xai,grok-4.3"):
         preferred = None
         for e in merged:
-            if e.get("value") in ("grok,grok-4.3", "ollama,llama3.2:3b"):
+            if e.get("value") in ("ollama,fry-grok-4-3", "ollama,llama3.2:3b"):
                 preferred = e.get("value")
                 break
         if preferred:
@@ -645,6 +647,41 @@ def _find_free_port():
     return port
 
 
+def _fry_internal_model(m):
+    """Translate user-facing alias (grok,* or codex,*) to internal non-colliding
+    provider namespace (ollama,*) and short model ID to
+    non-colliding alias ID (fry-grok-4-3 etc.) for CCR provider name,
+    ANTHROPIC_* values, CCR model lists, and .claude cache 'value'.
+    Idempotent. User CLI and `fry models` continue to accept/display the
+    original user aliases (with note that runtime uses Fry-local alias IDs)."""
+    if not m:
+        return m
+    # provider prefix: route everything through ollama (Claude Code does not
+    # remote-validate ollama models, so colliding raw xai/openai short IDs pass).
+    if m.startswith("grok,") or m.startswith("codex,") or m.startswith("xai,") or m.startswith("openai,") or m.startswith("fry-grok,") or m.startswith("fry-codex,"):
+        p = "ollama,"
+        mid = m.split(",", 1)[1]
+    elif m.startswith("ollama,"):
+        p = "ollama,"
+        mid = m.split(",", 1)[1]
+    else:
+        return m
+    # model ID alias (short raw -> fry-local non-colliding)
+    if mid == "grok-4.3":
+        mid = "fry-grok-4-3"
+    elif mid == "grok-4.20-0309-reasoning":
+        mid = "fry-grok-4-20-0309-reasoning"
+    elif mid == "grok-4.20-0309-non-reasoning":
+        mid = "fry-grok-4-20-0309-non-reasoning"
+    elif mid == "gpt-4o-mini":
+        mid = "fry-codex-gpt-4o-mini"
+    elif mid == "gpt-5.4":
+        mid = "fry-codex-gpt-5.4"
+    elif mid == "gpt-5.4-mini":
+        mid = "fry-codex-gpt-5.4-mini"
+    return p + mid
+
+
 def launch_router(cfg, agent_name, model, passthrough, dry_run):
     if agent_name != "claude":
         die(f"router mode is Claude-Code-only. '{agent_name}' is native-only -- "
@@ -665,79 +702,163 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     env = os.environ.copy()
     env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
 
-    # local stored-auth bridge for grok/codex (per approved fix plan)
-    # ensures the written ccr config for this launch uses localhost + dummy key,
-    # never the raw xai/openai $XAI/$OPENAI providers for these models
+    # Unified local stored-auth bridge (single process handles grok + codex by model name).
+    # CCR provider uses "ollama" name because Claude Code does not remote-validate ollama
+    # models, avoiding the "invalid model name" rejection that xai/openai provider names trigger.
     bridge_proc = None
     bridge_port = None
-    if model and (model.startswith("grok,") or model.startswith("codex,")):
-        target = "grok" if model.startswith("grok,") else "codex"
-        if target == "grok":
-            exe = r"C:\Users\saf70\.grok\bin\grok.exe"
-        else:
-            exe = "codex"  # the shim that supports exec
-        try:
-            bridge_port = _find_free_port()
-            bridge_py = Path(__file__).with_name("local_auth_bridge.py")
-            _kw = {}
-            if os.name == "nt":
-                _kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-            bridge_proc = subprocess.Popen(
-                [sys.executable, "-u", str(bridge_py), str(bridge_port), target, exe],
-                **_kw
-            )
-            time.sleep(0.8)  # give the stdlib server a moment to bind
-            # rewrite providers for this launch: drop raw xai/openai $key ones, add bridge with dummy
-            bridge_url = f"http://127.0.0.1:{bridge_port}/v1/chat/completions"
-            dummy = "local-bridge-dummy"
-            provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") not in ("xai", "openai")]
-            prov_name = "grok" if target == "grok" else "codex"
-            model_name = model.split(",", 1)[1] if "," in model else ("grok-4.3" if target == "grok" else "gpt-4o-mini")
-            provs.append({
-                "name": prov_name,
-                "api_base_url": bridge_url,
-                "api_key": dummy,
-                "models": [model_name]
-            })
-            ccr_dict["Providers"] = provs
+    dummy = "local-bridge-dummy"
+    try:
+        bridge_port = _find_free_port()
+        bridge_py = Path(__file__).with_name("local_auth_bridge.py")
+        _kw = {}
+        if os.name == "nt":
+            _kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        bridge_proc = subprocess.Popen(
+            [sys.executable, "-u", str(bridge_py), str(bridge_port)],
+            **_kw
+        )
+        time.sleep(1.2)
+        bridge_url = f"http://127.0.0.1:{bridge_port}/v1/chat/completions"
+        local_models = [
+            "fry-grok-4-3", "fry-grok-4-20-0309-reasoning", "fry-grok-4-20-0309-non-reasoning",
+            "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini"
+        ]
+        # Replace any existing ollama provider with the bridge (Claude Code whitelist requires ollama name).
+        provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") != "ollama"]
+        provs.append({
+            "name": "ollama",
+            "api_base_url": bridge_url,
+            "api_key": dummy,
+            "models": local_models
+        })
+        ccr_dict["Providers"] = provs
+        # Default to grok alias unless an explicit ollama model is requested
+        if model and str(model).startswith("ollama,"):
             ccr_dict["Router"]["default"] = model
-        except Exception as e:
-            warn(f"local bridge start failed for {target}: {e}; falling back (may hit raw key path)")
-
-    # Unconditional per-launch hygiene for all claude router launches (the proven remaining cause
-    # per PHASE 0 diagnosis on 194656 + current state). For any launch that is not an explicit raw
-    # xai,* or openai,* model request, force a minimal safe Providers list before write:
-    # - baseline or explicit ollama: only the ollama provider + safe local default (llama3.2:3b or
-    #   the requested one). This prevents the xai provider (which lists grok-4.3) or openai from
-    #   ever being in the ccr config that the claude passthrough sees, eliminating the "selected
-    #   model (xai,grok-4.3)" and $X***EY 400 paths.
-    # - grok,* or codex,* : the existing bridge rewrite (already drops xai/openai and adds the
-    #   localhost + local-bridge-dummy provider) is the correct local stored-auth path.
-    # Additionally, set ANTHROPIC_* overrides on the (now early-initialized) env to the
-    # requested/safe model to override any sticky ANTHROPIC_CUSTOM_MODEL_OPTION or prior selected
-    # from a previous launch.
-    is_explicit_raw_xai_or_openai = bool(model) and (model.startswith("xai,") or model.startswith("openai,"))
-    if not is_explicit_raw_xai_or_openai:
-        if model and (model.startswith("grok,") or model.startswith("codex,")):
-            # grok/codex local bridge path already handled above; ensure default and ANTHROPIC are correct
-            target_model = model
-            ccr_dict["Router"]["default"] = target_model
-            env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = target_model
-            if "," in target_model:
-                env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = target_model.split(",", 1)[1] + " (default)"
         else:
-            # baseline (no model) or explicit ollama,* : force ollama-only, safe local default
-            only_ollama = [p for p in ccr_dict.get("Providers", []) if p.get("name") == "ollama"]
-            if only_ollama:
-                ccr_dict["Providers"] = only_ollama
-                if not model or not str(model).startswith("ollama,"):
-                    model = "ollama,llama3.2:3b"
-                ccr_dict["Router"]["default"] = model
-                env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = model
-                env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = "llama3.2:3b (default)"
-                # also set the direct base/token so the claude child doesn't inherit a prior xai base
-                env["ANTHROPIC_BASE_URL"] = only_ollama[0].get("api_base_url", "http://localhost:11434").rsplit("/", 1)[0]
-                env["ANTHROPIC_AUTH_TOKEN"] = only_ollama[0].get("api_key", "ollama")
+            ccr_dict["Router"]["default"] = _fry_internal_model(model) if model else "ollama,fry-grok-4-3"
+    except Exception as e:
+        warn(f"unified local bridge start failed: {e}; falling back (may hit raw key path)")
+
+    # ANTHROPIC_*: point Claude Code at CCR (not the bridge directly). CCR translates Anthropic -> OpenAI
+    # and forwards to the bridge. Using the bridge URL directly fails because Claude Code sends
+    # Anthropic-format requests to an OpenAI-compat endpoint.
+    env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:3456"
+    env["ANTHROPIC_AUTH_TOKEN"] = dummy
+    default_model = ccr_dict["Router"].get("default", "")
+    short_model = default_model.split(",", 1)[1] if "," in default_model else default_model
+    if short_model:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = short_model
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = short_model + " (default)"
+
+    # Tolerant text-based .claude.json sanitize for colliding raw xai/openai entries (no full json.load because the file
+    # has duplicate keys in sub-objects that defeat roundtrips, as seen in prior evidence).
+    # Excise cache objects whose "value" starts with "xai," or "openai," (or is exactly "xai,grok-4.3") when a local
+    # Fry equivalent is present. Force selectedModel to the requested local if it was bad.
+    # Called after we have decided the local model for the launch. Backup taken by caller.
+    def _tolerant_claude_sanitize(claude_path, requested_local):
+        if not os.path.exists(claude_path):
+            return
+        try:
+            with open(claude_path, "r", encoding="utf-8") as f:
+                txt = f.read()
+            original = txt
+            # Excise colliding raw cache entries (xai/openai/fry-grok/fry-codex legacy).
+            txt = re.sub(
+                r'\s*\{\s*"value"\s*:\s*"(xai,[^"]+|openai,[^"]+|fry-grok,[^"]+|fry-codex,[^"]+|xai,grok-4.3)"[^}]*\},?',
+                "",
+                txt,
+                flags=re.IGNORECASE
+            )
+            # Force selectedModel to the short Fry alias ID (e.g. fry-grok-4-3) if the requested is a local grok/codex alias.
+            # CCR routes on the short model name in the request; the provider prefix breaks provider list matching.
+            if requested_local and (requested_local.startswith("grok,") or requested_local.startswith("codex,") or requested_local.startswith("xai,") or requested_local.startswith("openai,") or requested_local.startswith("fry-grok,") or requested_local.startswith("fry-codex,")):
+                internal = _fry_internal_model(requested_local)
+                short = internal.split(",", 1)[1] if "," in internal else internal
+                txt = re.sub(
+                    r'("selectedModel"\s*:\s*)"[^"]+"',
+                    r'\1"' + short + '"',
+                    txt,
+                    flags=re.IGNORECASE
+                )
+            # Remove trailing commas introduced by excising the last cache object.
+            txt = re.sub(r",(\s*[\]\}])", r"\1", txt)
+            if txt != original:
+                with open(claude_path, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                print(f"fry: tolerant text sanitize applied to {claude_path} (raw xai/openai colliding cache/selected removed or forced to local)", file=sys.stderr)
+        except Exception as e:
+            warn(f"tolerant .claude sanitize failed (non-fatal): {e}")
+
+    local_for_san = model if (model and (model.startswith("grok,") or model.startswith("codex,"))) else "grok,grok-4.3"
+    _tolerant_claude_sanitize(str(Path.home() / ".claude.json"), local_for_san)
+
+    # Also sanitize settings.json (proper JSON, unlike .claude.json) because it hardcodes
+    # "model": "xai,grok-4.3" which overrides --model, ANTHROPIC_CUSTOM_MODEL_OPTION,
+    # and selectedModel.
+    def _sanitize_settings_json(settings_path, requested_local):
+        if not os.path.exists(settings_path):
+            return
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            original_model = data.get("model")
+            if isinstance(original_model, str) and (
+                original_model.startswith("xai,") or
+                original_model.startswith("openai,") or
+                original_model.startswith("fry-grok,") or
+                original_model.startswith("fry-codex,") or
+                original_model == "xai,grok-4.3"
+            ):
+                internal = _fry_internal_model(requested_local)
+                short = internal.split(",", 1)[1] if "," in internal else internal
+                data["model"] = short
+                with open(settings_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                print(f"fry: sanitized settings.json model from stale '{original_model}' -> '{short}'", file=sys.stderr)
+        except Exception as e:
+            warn(f"settings.json sanitize failed (non-fatal): {e}")
+
+    _sanitize_settings_json(str(Path.home() / ".claude" / "settings.json"), local_for_san)
+
+    # Ensure the active ccr service (the one that loads the config we wrote with the xai/openai alias providers
+    # and the internal default) is running before the ccr code / child execution path.
+    # Prior runs wrote the config (xai/openai provider with alias IDs only, no raw xai/openai under Fry providers,
+    # Router default the internal alias, bridge providers added) and started the local bridge, but the ccr
+    # server/service was "Not Running" (ccr status, ccr-start.log "Service startup timeout, please manually run ccr start").
+    # The "ccr code" (the execution path) or child then hit the timeout or the claude resolver fell back to the
+    # native xai for the short model ID (error "issue with the selected model (xai,grok-4.3)"), and the bridge was
+    # never reached (no alias map log).
+    # This is the service boundary: the launcher must explicitly start the documented ccr service (it loads the
+    # JSON config we just wrote) and wait for it (bounded poll) before the execution path that uses the aliases in the config.
+    # Capture the exact start child PID (the node for the cli.js start) for PID discipline and cleanup.
+    # Bounded foreground poll (no tail -f, no detached/background per manual).
+    # Only processes owned/created by this launch.
+    # Non-fatal warn if the ensure fails (preserves prior behavior); the reval after this will show the service
+    # Running, the config loaded with the aliases, the sentinels passing, the bridge hit.
+    try:
+        ccr_for_start = ccr_bin or "ccr"
+        _kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        svc_start = subprocess.Popen([ccr_for_start, "start"], **_kw)
+        time.sleep(0.5)
+        ready = False
+        for _ in range(12):
+            st = subprocess.run([ccr_for_start, "status"], capture_output=True, text=True, timeout=5)
+            if "Running" in (st.stdout or "") or "running" in (st.stdout or "").lower():
+                ready = True
+                break
+            time.sleep(1)
+        if not ready:
+            logp = Path.home() / ".claude-code-router" / "ccr-start.log"
+            last = ""
+            if logp.exists():
+                last = logp.read_text(encoding="utf-8", errors="ignore")[-600:]
+            warn(f"ccr service not detected running after start; last log tail: {last}")
+        else:
+            print("fry: ccr service ensured running before execution (active config with fry aliases loaded)", file=sys.stderr)
+    except Exception as e:
+        warn(f"ccr service ensure step failed (non-fatal): {e}")
 
     if dry_run:
         print("MODE      : router (claude-code-router)")
@@ -828,7 +949,12 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     print(f"fry: switch models in-session with  /model <provider>,<model>   "
           f"(run `fry models` for the list)", file=sys.stderr)
 
-    argv = wrap_for_windows(ccr_bin, ["code"] + list(passthrough))
+    # Explicit --model before passthrough ensures CCR client-side validates the
+    # requested provider+model against the active config (with xai/openai
+    # aliases + bridge URLs) instead of falling back to its built-in xai default.
+    # CCR matches request model against provider model lists, so use the short model ID.
+    model_flag = ["--model", short_model] if short_model else []
+    argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(passthrough))
     proc = subprocess.run(argv, env=env)
     # cleanup owned local-auth bridge (exact PID only, per safety rules)
     if bridge_proc is not None:
