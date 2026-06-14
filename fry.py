@@ -1132,7 +1132,7 @@ def cmd_models(cfg, _args):
         if codex_bin:
             print("codex (local stored-auth via Codex CLI/OAuth - uses ~/.codex/auth.json):")
             print("  /model codex,gpt-5.4-mini          (confirmed working)")
-            print("  /model codex,gpt-5.4")
+            print("  /model codex,gpt-5.4               (confirmed working)")
             print("  /model codex,gpt-4o-mini")
             print("  /model codex,<model-name>           (any model your Codex CLI supports)")
             print()
