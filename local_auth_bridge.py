@@ -47,6 +47,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/v1/models":
             models = []
+            # NOTE: Bridge accepts any fry-codex-* or fry-grok-* model via prefix-strip/alias.
+            # This list is informational — unlisted fry-codex-* models still work if the
+            # underlying CLI supports them. Update this list as models are confirmed.
             for alias, real in [
                 ("fry-grok-4-3", "grok-4.3"),
                 ("fry-grok-4-20-0309-reasoning", "grok-4.20-0309-reasoning"),
@@ -101,12 +104,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 model = "grok-build"
             elif model == "fry-grok-4-20-0309-non-reasoning":
                 model = "grok-build"
-            elif model == "fry-codex-gpt-4o-mini":
-                model = "gpt-4o-mini"
-            elif model == "fry-codex-gpt-5.4":
-                model = "gpt-5.4"
-            elif model == "fry-codex-gpt-5.4-mini":
-                model = "gpt-5.4-mini"
+            elif model.startswith("fry-codex-"):
+                model = model[len("fry-codex-"):]
             if model != req_model:
                 print(f"[bridge alias map] requested={req_model} mapped={model}", file=sys.stderr)
 

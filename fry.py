@@ -667,18 +667,16 @@ def _fry_internal_model(m):
     else:
         return m
     # model ID alias (short raw -> fry-local non-colliding)
+    # Grok: hardcoded (all variants → grok-build in bridge, dot-to-hyphen sanitized)
     if mid == "grok-4.3":
         mid = "fry-grok-4-3"
     elif mid == "grok-4.20-0309-reasoning":
         mid = "fry-grok-4-20-0309-reasoning"
     elif mid == "grok-4.20-0309-non-reasoning":
         mid = "fry-grok-4-20-0309-non-reasoning"
-    elif mid == "gpt-4o-mini":
-        mid = "fry-codex-gpt-4o-mini"
-    elif mid == "gpt-5.4":
-        mid = "fry-codex-gpt-5.4"
-    elif mid == "gpt-5.4-mini":
-        mid = "fry-codex-gpt-5.4-mini"
+    # Codex: dynamic passthrough — any model name accepted, bridge strips fry-codex- prefix
+    elif not mid.startswith("fry-"):
+        mid = "fry-codex-" + mid
     return p + mid
 
 
@@ -1133,9 +1131,10 @@ def cmd_models(cfg, _args):
         codex_bin = resolve_bin(["codex", "codex.cmd", "codex.exe"])
         if codex_bin:
             print("codex (local stored-auth via Codex CLI/OAuth - uses ~/.codex/auth.json):")
-            print("  /model codex,gpt-5.4-mini")
+            print("  /model codex,gpt-5.4-mini          (confirmed working)")
             print("  /model codex,gpt-5.4")
             print("  /model codex,gpt-4o-mini")
+            print("  /model codex,<model-name>           (any model your Codex CLI supports)")
             print()
     except Exception:
         pass
