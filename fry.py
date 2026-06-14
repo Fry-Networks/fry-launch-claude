@@ -228,17 +228,21 @@ def list_openai_compatible_models(base_url, api_key=None, timeout=10, max_attemp
     return []
 
 
-def discover_xai_key():
+def discover_xai_key(reauth_if_needed=False):
     """Discover xAI API key. Priority:
     1. ~/.grok/auth.json — find JWT-shaped field, check expiry, test against xAI API
-    2. XAI_API_KEY env var (fallback)
-    3. Fail closed
+    2. If reauth_if_needed and no valid JWT, run `grok login` once and re-read
+    3. XAI_API_KEY env var (fallback)
+    4. Fail closed
     Returns (key, source_label) or (None, reason).
     Never prints token values. Never persists to disk."""
     grok_path = Path.home() / ".grok" / "auth.json"
-    if grok_path.exists():
+
+    def _load_valid_jwt(path):
+        if not path.exists():
+            return None
         try:
-            data = json.loads(grok_path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             for _oidc_key, entry in data.items():
                 if not isinstance(entry, dict):
                     continue
@@ -259,11 +263,32 @@ def discover_xai_key():
                     )
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         if resp.status == 200:
-                            return (jwt, "grok-cli")
+                            return jwt
                 except Exception:
                     pass
         except (json.JSONDecodeError, OSError):
             pass
+        return None
+
+    jwt = _load_valid_jwt(grok_path)
+    if jwt:
+        return (jwt, "grok-cli")
+
+    if reauth_if_needed:
+        grok_bin = resolve_bin(["grok", "grok.cmd", "grok.exe"])
+        if grok_bin:
+            warn("grok auth expired/invalid; running 'grok login' once ...")
+            try:
+                proc = subprocess.run([grok_bin, "login"], timeout=300)
+                if proc.returncode == 0:
+                    jwt = _load_valid_jwt(grok_path)
+                    if jwt:
+                        return (jwt, "grok-cli")
+                    warn("grok login finished but no valid JWT found.")
+                else:
+                    warn(f"grok login failed (rc={proc.returncode}).")
+            except Exception as e:
+                warn(f"grok login invocation failed: {e}")
 
     env_key = os.environ.get("XAI_API_KEY")
     if env_key:
@@ -272,25 +297,40 @@ def discover_xai_key():
     return (None, "no auth — run 'grok login' or set XAI_API_KEY")
 
 
-def discover_openai_key():
+def discover_openai_key(reauth_if_needed=False):
     """Discover OpenAI API key. Priority:
     1. ~/.codex/auth.json — static OPENAI_API_KEY if present
     2. ~/.codex/auth.json tokens.access_token — test against OpenAI API;
        if it works (HTTP 200) treat as usable; if 403 "Missing scopes" it is
        OAuth (ChatGPT login) and incompatible with router API-key path.
-    3. OPENAI_API_KEY env var (fallback)
-    4. Fail closed
+    3. If reauth_if_needed and the OAuth token is incompatible, try converting
+       with `codex login --with-api-key` using the OPENAI_API_KEY env var once.
+    4. OPENAI_API_KEY env var (fallback)
+    5. Fail closed
     Returns (key, source_label) or (None, reason).
     Never prints token values. Never persists to disk."""
     codex_path = Path.home() / ".codex" / "auth.json"
+    source = "no auth — run 'codex login --with-api-key' or set OPENAI_API_KEY"
+
+    def _load_static_key(path):
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            static_key = data.get("OPENAI_API_KEY", "")
+            if isinstance(static_key, str) and static_key.startswith("sk-"):
+                return static_key
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    static_key = _load_static_key(codex_path)
+    if static_key:
+        return (static_key, "codex-cli")
+
     if codex_path.exists():
         try:
             data = json.loads(codex_path.read_text(encoding="utf-8"))
-            # 1. static API key (set via codex login --with-api-key)
-            static_key = data.get("OPENAI_API_KEY", "")
-            if isinstance(static_key, str) and static_key.startswith("sk-"):
-                return (static_key, "codex-cli")
-            # 2. OAuth access token — test compatibility
             tokens = data.get("tokens", {})
             if isinstance(tokens, dict):
                 jwt = tokens.get("access_token", "")
@@ -307,17 +347,41 @@ def discover_openai_key():
                         if e.code == 403:
                             body = e.read().decode()[:200]
                             if "Missing scopes" in body or "insufficient permissions" in body:
-                                return (None, "codex-cli-oauth-incompatible")
+                                source = "codex-cli-oauth-incompatible"
                     except Exception:
                         pass
         except (json.JSONDecodeError, OSError):
             pass
 
+    if source == "codex-cli-oauth-incompatible" and reauth_if_needed:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            codex_bin = resolve_bin(["codex", "codex.cmd", "codex.exe"])
+            if codex_bin:
+                warn("Codex auth is ChatGPT OAuth; converting to API key with 'codex login --with-api-key' ...")
+                try:
+                    proc = subprocess.run(
+                        [codex_bin, "login", "--with-api-key"],
+                        input=api_key + "\n",
+                        text=True,
+                        capture_output=True,
+                        timeout=120,
+                    )
+                    if proc.returncode == 0:
+                        static_key = _load_static_key(codex_path)
+                        if static_key:
+                            return (static_key, "codex-cli")
+                        warn("codex login --with-api-key finished but no static key found.")
+                    else:
+                        warn(f"codex login --with-api-key failed (rc={proc.returncode}).")
+                except Exception as e:
+                    warn(f"codex login --with-api-key invocation failed: {e}")
+
     env_key = os.environ.get("OPENAI_API_KEY")
     if env_key:
         return (env_key, "env")
 
-    return (None, "no auth — run 'codex login --with-api-key' or set OPENAI_API_KEY")
+    return (None, source)
 
 
 # --------------------------------------------------------------------------- #
@@ -498,13 +562,17 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
           f"({len(kept)} preserved, {len(merged)} total)", file=sys.stderr)
 
 
-def compile_ccr_config(cfg, override_default=None):
+def compile_ccr_config(cfg, override_default=None, interactive_reauth=False, bridge_active=False):
     """
     Build a claude-code-router config dict from fry config.
     Returns (ccr_dict, env_needed) where env_needed is a list of dicts:
     {"env_var": ..., "provider": ..., "source": ...}
     that must be exported before launch. API keys appear ONLY as $VAR placeholders.
     Providers whose secret cannot be resolved are dropped (with a warning).
+
+    interactive_reauth: when True, discover_* functions may prompt for login
+    (used only by launch_router). bridge_active suppresses the Codex ChatGPT-OAuth
+    warning because the local bridge invokes `codex exec` with its own stored auth.
     """
     providers_out = []
     env_needed = []
@@ -522,7 +590,7 @@ def compile_ccr_config(cfg, override_default=None):
         if discover == "xai":
             env_var = env_var or "XAI_API_KEY"
             # 1. live CLI auth source
-            key, source = discover_xai_key()
+            key, source = discover_xai_key(reauth_if_needed=interactive_reauth)
             if not key:
                 # 2. credentials.json / env var
                 key = resolve_local_secret(env_var, pname)
@@ -547,8 +615,8 @@ def compile_ccr_config(cfg, override_default=None):
                 source = None
                 if pname == "openai":
                     # 1. live CLI auth source
-                    key, source = discover_openai_key()
-                if not key and source == "codex-cli-oauth-incompatible":
+                    key, source = discover_openai_key(reauth_if_needed=interactive_reauth)
+                if not key and source == "codex-cli-oauth-incompatible" and not bridge_active:
                     warn(f"router provider '{pname}': Codex CLI auth detected (ChatGPT OAuth) but incompatible with router API-key path. Run 'codex login --with-api-key' or set {env_var}.")
                 if not key:
                     # 2. credentials.json / env var
@@ -743,7 +811,11 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         die(f"in router mode --model must be '<provider>,<model>' (got '{model}'). "
             f"Run `fry models` to see valid strings.")
 
-    ccr_dict, env_needed = compile_ccr_config(cfg, override_default=model)
+    ccr_dict, env_needed = compile_ccr_config(
+        cfg, override_default=model,
+        interactive_reauth=not dry_run,
+        bridge_active=True,
+    )
 
     ccr_bin = resolve_bin(["ccr", "ccr.cmd", "ccr.exe"])
 
