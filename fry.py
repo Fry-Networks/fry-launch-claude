@@ -43,6 +43,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import hashlib
 from pathlib import Path
 
 VERSION = "0.3.3"
@@ -52,6 +53,43 @@ DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
 REDACT = "<redacted>"
 
 CREDENTIALS_PATH = FRY_HOME / "credentials.json"
+
+
+def _auto_sync_from_repo():
+    """Auto-update the installed ~/.fry/fry.py from the repo canonical copy.
+
+    If the currently executing script is the installed copy, compare it to
+    the canonical repo copy. If the repo differs, copy it over and re-execute
+    the current process with the updated file. Any failure is non-fatal.
+    """
+    repo_path = Path(r"D:\Fry Networks\repos\fry\fry.py")
+    installed_path = (Path.home() / ".fry" / "fry.py").resolve()
+    current_path = Path(__file__).resolve()
+
+    if current_path != installed_path:
+        return
+    if not repo_path.exists():
+        return
+
+    def _sha256(path):
+        h = hashlib.sha256()
+        h.update(path.read_bytes())
+        return h.hexdigest()
+
+    try:
+        if _sha256(current_path) == _sha256(repo_path):
+            return
+        installed_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo_path, installed_path)
+        print(f"fry: auto-synced installed copy from repo ({repo_path})", file=sys.stderr)
+        # Re-run the freshly copied installed script with the same interpreter
+        # and the same command-line arguments. os.execv is unreliable on
+        # Windows (spaces in sys.executable, stdout inheritance in some shells),
+        # so we delegate to a subprocess and inherit its exit code.
+        proc = subprocess.run([sys.executable, str(installed_path)] + sys.argv[1:])
+        sys.exit(proc.returncode)
+    except Exception:
+        pass
 
 
 def load_credentials():
@@ -1399,6 +1437,7 @@ def main():
 
 
 if __name__ == "__main__":
+    _auto_sync_from_repo()
     try:
         sys.exit(main())
     except KeyboardInterrupt:
