@@ -34,6 +34,7 @@ def run_cli(prompt, model):
             capture_output=True,
             timeout=180,
             text=True,
+            stdin=subprocess.DEVNULL,
             creationflags=0x08000000 if sys.platform == "win32" else 0,
         )
         if proc.returncode == 0:

@@ -647,6 +647,60 @@ def _find_free_port():
     return port
 
 
+def _kill_stale_bridge_processes(bridge_script_name="local_auth_bridge.py"):
+    """Kill python processes whose command line contains the bridge script.
+    Excludes the current fry.py process. Windows only; no-op elsewhere.
+    Uses PowerShell so it works from cmd, PowerShell, and Git Bash."""
+    import platform
+    if platform.system() != "Windows":
+        return
+    current_pid = os.getpid()
+    try:
+        ps_cmd = (
+            "Get-WmiObject Win32_Process -Filter \"CommandLine LIKE '%" + bridge_script_name + "%'\" | "
+            "ForEach-Object { $procId = $_.ProcessId; "
+            "if ($procId -ne " + str(current_pid) + ") { "
+            "Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue; "
+            "Write-Host \"killed stale bridge PID $procId\" } }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 and proc.stderr:
+            warn(f"stale bridge cleanup stderr: {proc.stderr.strip()}")
+    except Exception as e:
+        warn(f"stale bridge cleanup failed (non-fatal): {e}")
+
+
+def _kill_stale_ccr(router_port=3456):
+    """Stop CCR via CLI, then force-kill any remaining 127.0.0.1:<router_port> listener."""
+    ccr_bin = resolve_bin(["ccr", "ccr.cmd", "ccr.exe"])
+    if ccr_bin:
+        try:
+            subprocess.run(wrap_for_windows(ccr_bin, ["stop"]),
+                           capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    try:
+        ns = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+        for ln in ns.stdout.splitlines():
+            if f"127.0.0.1:{router_port}" in ln and "LISTENING" in ln:
+                parts = ln.split()
+                if parts:
+                    try:
+                        pid = int(parts[-1])
+                        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                       capture_output=True)
+                        print(f"fry: killed stale ccr listener PID {pid}", file=sys.stderr)
+                    except ValueError:
+                        pass
+                break
+    except Exception as e:
+        warn(f"stale ccr cleanup failed (non-fatal): {e}")
+
+
 def _fry_internal_model(m):
     """Translate user-facing alias (grok,* or codex,*) to internal non-colliding
     provider namespace (ollama,*) and short model ID to
@@ -706,6 +760,13 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     bridge_proc = None
     bridge_port = None
     dummy = "local-bridge-dummy"
+    local_models = [
+        "fry-grok-4-3", "fry-grok-4-20-0309-reasoning", "fry-grok-4-20-0309-non-reasoning",
+        "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini"
+    ]
+    # Clean up any leftover bridge/CCR state from previous launches so we bind a fresh port.
+    _kill_stale_bridge_processes()
+    _kill_stale_ccr(cfg.get("router", {}).get("port", 3456))
     try:
         bridge_port = _find_free_port()
         bridge_py = Path(__file__).with_name("local_auth_bridge.py")
@@ -717,11 +778,19 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             **_kw
         )
         time.sleep(1.2)
+        # Wait for the bridge HTTP endpoint to be ready before declaring the port live.
+        for _ in range(25):
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{bridge_port}/v1/models")
+                with urllib.request.urlopen(req, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            warn("local bridge did not report ready; proceeding anyway")
         bridge_url = f"http://127.0.0.1:{bridge_port}/v1/chat/completions"
-        local_models = [
-            "fry-grok-4-3", "fry-grok-4-20-0309-reasoning", "fry-grok-4-20-0309-non-reasoning",
-            "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini"
-        ]
         # Replace any existing ollama provider with the bridge (Claude Code whitelist requires ollama name).
         provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") != "ollama"]
         provs.append({
@@ -802,15 +871,10 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             with open(settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             original_model = data.get("model")
-            if isinstance(original_model, str) and (
-                original_model.startswith("xai,") or
-                original_model.startswith("openai,") or
-                original_model.startswith("fry-grok,") or
-                original_model.startswith("fry-codex,") or
-                original_model == "xai,grok-4.3"
-            ):
-                internal = _fry_internal_model(requested_local)
-                short = internal.split(",", 1)[1] if "," in internal else internal
+            valid_fry_short = set(local_models)
+            internal = _fry_internal_model(requested_local) if requested_local else _fry_internal_model("grok,grok-4.3")
+            short = internal.split(",", 1)[1] if "," in internal else internal
+            if isinstance(original_model, str) and original_model not in valid_fry_short:
                 data["model"] = short
                 with open(settings_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
@@ -819,44 +883,6 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             warn(f"settings.json sanitize failed (non-fatal): {e}")
 
     _sanitize_settings_json(str(Path.home() / ".claude" / "settings.json"), local_for_san)
-
-    # Ensure the active ccr service (the one that loads the config we wrote with the xai/openai alias providers
-    # and the internal default) is running before the ccr code / child execution path.
-    # Prior runs wrote the config (xai/openai provider with alias IDs only, no raw xai/openai under Fry providers,
-    # Router default the internal alias, bridge providers added) and started the local bridge, but the ccr
-    # server/service was "Not Running" (ccr status, ccr-start.log "Service startup timeout, please manually run ccr start").
-    # The "ccr code" (the execution path) or child then hit the timeout or the claude resolver fell back to the
-    # native xai for the short model ID (error "issue with the selected model (xai,grok-4.3)"), and the bridge was
-    # never reached (no alias map log).
-    # This is the service boundary: the launcher must explicitly start the documented ccr service (it loads the
-    # JSON config we just wrote) and wait for it (bounded poll) before the execution path that uses the aliases in the config.
-    # Capture the exact start child PID (the node for the cli.js start) for PID discipline and cleanup.
-    # Bounded foreground poll (no tail -f, no detached/background per manual).
-    # Only processes owned/created by this launch.
-    # Non-fatal warn if the ensure fails (preserves prior behavior); the reval after this will show the service
-    # Running, the config loaded with the aliases, the sentinels passing, the bridge hit.
-    try:
-        ccr_for_start = ccr_bin or "ccr"
-        _kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-        svc_start = subprocess.Popen([ccr_for_start, "start"], **_kw)
-        time.sleep(0.5)
-        ready = False
-        for _ in range(12):
-            st = subprocess.run([ccr_for_start, "status"], capture_output=True, text=True, timeout=5)
-            if "Running" in (st.stdout or "") or "running" in (st.stdout or "").lower():
-                ready = True
-                break
-            time.sleep(1)
-        if not ready:
-            logp = Path.home() / ".claude-code-router" / "ccr-start.log"
-            last = ""
-            if logp.exists():
-                last = logp.read_text(encoding="utf-8", errors="ignore")[-600:]
-            warn(f"ccr service not detected running after start; last log tail: {last}")
-        else:
-            print("fry: ccr service ensured running before execution (active config with fry aliases loaded)", file=sys.stderr)
-    except Exception as e:
-        warn(f"ccr service ensure step failed (non-fatal): {e}")
 
     if dry_run:
         print("MODE      : router (claude-code-router)")
@@ -908,39 +934,31 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     path = write_ccr_config(cfg, ccr_dict)
     inject_model_cache(ccr_dict)
 
-    # Restart CCR if running so it picks up fresh config and env vars.
-    # Enhanced bounded readiness wait (addresses the CCR service startup/timeout
-    # root cause): after restart, poll status until "Running" or timeout before
-    # proceeding to the "ccr code" passthrough. This proves the service is using
-    # the freshly written config.
+    # Start CCR fresh so it definitely loads the config we just wrote (with the live bridge URL).
     _ccr_kw = {}
     if os.name == "nt":
         _ccr_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        status_argv = wrap_for_windows(ccr_bin, ["status"])
-        status = subprocess.run(status_argv, capture_output=True, text=True, timeout=5, **_ccr_kw)
-        if status.returncode == 0 and "Running" in status.stdout:
-            restart_argv = wrap_for_windows(ccr_bin, ["restart"])
-            restart = subprocess.run(restart_argv, capture_output=True, text=True, timeout=15, **_ccr_kw)
-            if restart.returncode != 0:
-                warn(f"CCR restart failed: {restart.stderr or restart.stdout}")
-            else:
-                # Robust poll for readiness (up to ~20s). This is the scoped CCR
-                # service lifecycle action (status + restart + our poll), not broad kill.
-                ready = False
-                for _ in range(40):
-                    time.sleep(0.5)
-                    try:
-                        chk = subprocess.run(status_argv, capture_output=True, text=True, timeout=5, **_ccr_kw)
-                        if chk.returncode == 0 and "Running" in chk.stdout:
-                            ready = True
-                            break
-                    except Exception:
-                        pass
-                if not ready:
-                    warn("CCR did not report Running within timeout after restart; proceeding (may still fail)")
+        ccr_for_start = ccr_bin or "ccr"
+        subprocess.run(wrap_for_windows(ccr_for_start, ["stop"]),
+                       capture_output=True, text=True, timeout=15, **_ccr_kw)
+        time.sleep(0.5)
+        _kill_stale_ccr(cfg.get("router", {}).get("port", 3456))
+        subprocess.Popen(wrap_for_windows(ccr_for_start, ["start"]), **_ccr_kw)
+        ready = False
+        for _ in range(30):
+            time.sleep(1)
+            st = subprocess.run(wrap_for_windows(ccr_for_start, ["status"]),
+                              capture_output=True, text=True, timeout=5, **_ccr_kw)
+            if "Running" in (st.stdout or ""):
+                ready = True
+                break
+        if not ready:
+            warn("CCR service did not report Running within timeout; proceeding anyway")
+        else:
+            print("fry: CCR running with fresh config", file=sys.stderr)
     except Exception as e:
-        warn(f"CCR status check failed: {e}")
+        warn(f"CCR fresh-start step failed (non-fatal): {e}")
 
     print(f"fry: wrote router config -> {path}", file=sys.stderr)
     print(f"fry: injected model cache into ~/.claude.json", file=sys.stderr)
