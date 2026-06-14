@@ -1133,9 +1133,9 @@ def cmd_models(cfg, _args):
         codex_bin = resolve_bin(["codex", "codex.cmd", "codex.exe"])
         if codex_bin:
             print("codex (local stored-auth via Codex CLI/OAuth - uses ~/.codex/auth.json):")
-            print("  /model codex,gpt-4o-mini")
-            print("  /model codex,gpt-5.4")
             print("  /model codex,gpt-5.4-mini")
+            print("  /model codex,gpt-5.4")
+            print("  /model codex,gpt-4o-mini")
             print()
     except Exception:
         pass
