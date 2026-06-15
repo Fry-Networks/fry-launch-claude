@@ -77,11 +77,30 @@ def _auto_sync_from_repo():
         return h.hexdigest()
 
     try:
-        if _sha256(current_path) == _sha256(repo_path):
+        changed = False
+        if _sha256(current_path) != _sha256(repo_path):
+            installed_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(repo_path, installed_path)
+            print(f"fry: auto-synced installed copy from repo ({repo_path})", file=sys.stderr)
+            changed = True
+        # Also sync companion bridge script
+        repo_bridge = repo_path.with_name("local_auth_bridge.py")
+        installed_bridge = installed_path.with_name("local_auth_bridge.py")
+        if repo_bridge.exists() and installed_bridge.exists():
+            if _sha256(repo_bridge) != _sha256(installed_bridge):
+                shutil.copy2(repo_bridge, installed_bridge)
+                print(f"fry: auto-synced installed bridge from repo ({repo_bridge})", file=sys.stderr)
+                changed = True
+        # Also sync companion Ollama scrub proxy script
+        repo_scrub = repo_path.with_name("ollama_scrub_proxy.py")
+        installed_scrub = installed_path.with_name("ollama_scrub_proxy.py")
+        if repo_scrub.exists() and (not installed_scrub.exists() or _sha256(repo_scrub) != _sha256(installed_scrub)):
+            installed_scrub.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(repo_scrub, installed_scrub)
+            print(f"fry: auto-synced installed scrub proxy from repo ({repo_scrub})", file=sys.stderr)
+            changed = True
+        if not changed:
             return
-        installed_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(repo_path, installed_path)
-        print(f"fry: auto-synced installed copy from repo ({repo_path})", file=sys.stderr)
         # Re-run the freshly copied installed script with the same interpreter
         # and the same command-line arguments. os.execv is unreliable on
         # Windows (spaces in sys.executable, stdout inheritance in some shells),
@@ -700,6 +719,25 @@ def compile_ccr_config(cfg, override_default=None, interactive_reauth=False, bri
             prov["transformer"] = {"use": [prouter["transformer"]]}
         providers_out.append(prov)
 
+    # Additive local-ollama provider (direct, not through bridge)
+    try:
+        ol = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10)
+        ol_models = []
+        for ln in ol.stdout.splitlines()[1:]:
+            parts = ln.split()
+            if parts:
+                ol_models.append(parts[0])
+        if not ol_models:
+            ol_models = ["llama3.2:3b"]
+    except Exception:
+        ol_models = ["llama3.2:3b"]
+    providers_out.append({
+        "name": "local-ollama",
+        "api_base_url": "http://localhost:11434/v1/chat/completions",
+        "api_key": "not-needed",
+        "models": ol_models,
+    })
+
     if not providers_out:
         die("no usable router providers — Ollama may be starting up or unavailable. "
             "Check `ollama list`, or run `fry launch claude --native` to use subscription Claude now.")
@@ -780,7 +818,8 @@ def _kill_stale_bridge_processes(bridge_script_name="local_auth_bridge.py"):
 
 
 def _kill_stale_ccr(router_port=3456):
-    """Stop CCR via CLI, then force-kill any remaining 127.0.0.1:<router_port> listener."""
+    """Stop CCR via CLI, then force-kill any remaining CCR listener by command-line
+    match and netstat parsing. Poll up to 5s for the port to become free."""
     ccr_bin = resolve_bin(["ccr", "ccr.cmd", "ccr.exe"])
     if ccr_bin:
         try:
@@ -789,6 +828,23 @@ def _kill_stale_ccr(router_port=3456):
         except Exception:
             pass
         time.sleep(0.5)
+    # Also hunt by distinctive command line (covers cases where netstat misses it)
+    try:
+        ps_cmd = (
+            "Get-WmiObject Win32_Process | "
+            "Where-Object { $_.CommandLine -like '*claude-code-router*cli.js*start*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
+            "Write-Host \"killed stale ccr PID $($_.ProcessId)\" }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True, text=True,
+        )
+        if proc.stdout:
+            print(proc.stdout.strip(), file=sys.stderr)
+    except Exception as e:
+        warn(f"stale ccr command-line cleanup failed (non-fatal): {e}")
+    # Classic netstat/taskkill fallback
     try:
         ns = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
         for ln in ns.stdout.splitlines():
@@ -804,7 +860,16 @@ def _kill_stale_ccr(router_port=3456):
                         pass
                 break
     except Exception as e:
-        warn(f"stale ccr cleanup failed (non-fatal): {e}")
+        warn(f"stale ccr netstat cleanup failed (non-fatal): {e}")
+    # Poll up to 5s for port to become free
+    for _ in range(25):
+        try:
+            ns = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+            if f"127.0.0.1:{router_port}" not in ns.stdout:
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
 
 
 def _fry_internal_model(m):
@@ -822,21 +887,26 @@ def _fry_internal_model(m):
         p = "ollama,"
         mid = m.split(",", 1)[1]
     elif m.startswith("ollama,"):
-        p = "ollama,"
         mid = m.split(",", 1)[1]
+        if mid.startswith("fry-grok-") or mid.startswith("fry-codex-"):
+            p = "ollama,"
+        else:
+            p = "local-ollama,"
     else:
         return m
-    # model ID alias (short raw -> fry-local non-colliding)
-    # Grok: hardcoded (all variants → grok-build in bridge, dot-to-hyphen sanitized)
-    if mid == "grok-4.3":
-        mid = "fry-grok-4-3"
-    elif mid == "grok-4.20-0309-reasoning":
-        mid = "fry-grok-4-20-0309-reasoning"
-    elif mid == "grok-4.20-0309-non-reasoning":
-        mid = "fry-grok-4-20-0309-non-reasoning"
-    # Codex: dynamic passthrough — any model name accepted, bridge strips fry-codex- prefix
-    elif not mid.startswith("fry-"):
-        mid = "fry-codex-" + mid
+    # model ID alias (short raw -> fry-local non-colliding) only when routed
+    # through the local bridge provider. For local-ollama HTTP, pass raw IDs.
+    if p == "ollama,":
+        # Grok: hardcoded (all variants → grok-build in bridge, dot-to-hyphen sanitized)
+        if mid == "grok-4.3":
+            mid = "fry-grok-4-3"
+        elif mid == "grok-4.20-0309-reasoning":
+            mid = "fry-grok-4-20-0309-reasoning"
+        elif mid == "grok-4.20-0309-non-reasoning":
+            mid = "fry-grok-4-20-0309-non-reasoning"
+        # Codex: dynamic passthrough — any model name accepted, bridge strips fry-codex- prefix
+        elif not mid.startswith("fry-"):
+            mid = "fry-codex-" + mid
     return p + mid
 
 
@@ -869,13 +939,16 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     # models, avoiding the "invalid model name" rejection that xai/openai provider names trigger.
     bridge_proc = None
     bridge_port = None
+    scrub_proc = None
+    scrub_port = None
     dummy = "local-bridge-dummy"
     local_models = [
         "fry-grok-4-3", "fry-grok-4-20-0309-reasoning", "fry-grok-4-20-0309-non-reasoning",
         "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini"
     ]
     # Clean up any leftover bridge/CCR state from previous launches so we bind a fresh port.
-    _kill_stale_bridge_processes()
+    _kill_stale_bridge_processes("local_auth_bridge.py")
+    _kill_stale_bridge_processes("ollama_scrub_proxy.py")
     _kill_stale_ccr(cfg.get("router", {}).get("port", 3456))
     try:
         bridge_port = _find_free_port()
@@ -910,13 +983,57 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             "models": local_models
         })
         ccr_dict["Providers"] = provs
-        # Default to grok alias unless an explicit ollama model is requested
-        if model and str(model).startswith("ollama,"):
-            ccr_dict["Router"]["default"] = model
-        else:
-            ccr_dict["Router"]["default"] = _fry_internal_model(model) if model else "ollama,fry-grok-4-3"
+        # Always translate user-facing aliases so raw ollama,<model> hits local-ollama
+        ccr_dict["Router"]["default"] = _fry_internal_model(model) if model else "ollama,fry-grok-4-3"
     except Exception as e:
         warn(f"unified local bridge start failed: {e}; falling back (may hit raw key path)")
+
+    # Per-launch Ollama scrub proxy — ONLY for local-ollama routes.
+    _resolved = _fry_internal_model(model) if model else ""
+    if not dry_run and _resolved.startswith("local-ollama,"):
+        try:
+            scrub_port = _find_free_port()
+            scrub_py = Path(__file__).with_name("ollama_scrub_proxy.py")
+            _scrub_kw = {}
+            if os.name == "nt":
+                _scrub_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            scrub_proc = subprocess.Popen(
+                [sys.executable, "-u", str(scrub_py), str(scrub_port)], **_scrub_kw
+            )
+            ready = False
+            for _ in range(25):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{scrub_port}/health", timeout=1) as r:
+                        if r.status == 200:
+                            ready = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            if not ready:
+                warn("ollama scrub proxy did not report ready; falling back to direct Ollama")
+                try:
+                    if scrub_proc is not None and scrub_proc.poll() is None:
+                        scrub_proc.terminate()
+                except Exception:
+                    pass
+                scrub_proc = None
+                scrub_port = None
+            else:
+                # Rewrite local-ollama provider URL to route through scrub proxy.
+                for prov in ccr_dict.get("Providers", []):
+                    if prov.get("name") == "local-ollama":
+                        prov["api_base_url"] = f"http://127.0.0.1:{scrub_port}/v1/chat/completions"
+                        break
+        except Exception as e:
+            warn(f"ollama scrub proxy start failed: {e}; falling back to direct Ollama")
+            try:
+                if scrub_proc is not None and scrub_proc.poll() is None:
+                    scrub_proc.terminate()
+            except Exception:
+                pass
+            scrub_proc = None
+            scrub_port = None
 
     # ANTHROPIC_*: point Claude Code at CCR (not the bridge directly). CCR translates Anthropic -> OpenAI
     # and forwards to the bridge. Using the bridge URL directly fails because Claude Code sends
@@ -982,9 +1099,21 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
                 data = json.load(f)
             original_model = data.get("model")
             valid_fry_short = set(local_models)
+            # Derive known CCR provider names from the generated config dict
+            known_providers = {p.get("name") for p in ccr_dict.get("Providers", []) if p.get("name")}
             internal = _fry_internal_model(requested_local) if requested_local else _fry_internal_model("grok,grok-4.3")
             short = internal.split(",", 1)[1] if "," in internal else internal
-            if isinstance(original_model, str) and original_model not in valid_fry_short:
+            needs_rewrite = False
+            if isinstance(original_model, str):
+                if original_model in valid_fry_short:
+                    pass  # valid short alias
+                elif "," in original_model and original_model.split(",", 1)[0] in known_providers:
+                    pass  # valid provider-prefixed CCR-format string
+                else:
+                    needs_rewrite = True
+            else:
+                needs_rewrite = True
+            if needs_rewrite:
                 data["model"] = short
                 with open(settings_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
@@ -993,6 +1122,24 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             warn(f"settings.json sanitize failed (non-fatal): {e}")
 
     _sanitize_settings_json(str(Path.home() / ".claude" / "settings.json"), local_for_san)
+
+    # Deterministic model-key self-heal: ensure settings.json has the exact model
+    # this launch is routing, so a missing or clobbered key self-corrects.
+    _resolved_for_settings = default_model or "ollama,fry-grok-4-3"
+    try:
+        _settings_path = Path.home() / ".claude" / "settings.json"
+        if _settings_path.exists():
+            with open(_settings_path, "r", encoding="utf-8") as f:
+                _sdata = json.load(f)
+        else:
+            _sdata = {}
+        if _sdata.get("model") != _resolved_for_settings:
+            _sdata["model"] = _resolved_for_settings
+            with open(_settings_path, "w", encoding="utf-8") as f:
+                json.dump(_sdata, f, indent=2)
+            print(f"fry: self-healed settings.json model -> '{_resolved_for_settings}'", file=sys.stderr)
+    except Exception as e:
+        warn(f"settings.json model self-heal failed (non-fatal): {e}")
 
     if dry_run:
         print("MODE      : router (claude-code-router)")
@@ -1075,11 +1222,10 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     print(f"fry: switch models in-session with  /model <provider>,<model>   "
           f"(run `fry models` for the list)", file=sys.stderr)
 
-    # Explicit --model before passthrough ensures CCR client-side validates the
-    # requested provider+model against the active config (with xai/openai
-    # aliases + bridge URLs) instead of falling back to its built-in xai default.
-    # CCR matches request model against provider model lists, so use the short model ID.
-    model_flag = ["--model", short_model] if short_model else []
+    # Explicit --model before passthrough ensures CCR/Claude Code validate against
+    # the active config. Pass the full provider-prefixed string (e.g. ollama,fry-grok-4-3)
+    # so Claude Code sees the ollama provider and CCR routes to the live bridge.
+    model_flag = ["--model", default_model] if default_model else []
     argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(passthrough))
     proc = subprocess.run(argv, env=env)
     # cleanup owned local-auth bridge (exact PID only, per safety rules)
@@ -1087,6 +1233,13 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         try:
             if bridge_proc.poll() is None:
                 bridge_proc.terminate()
+        except Exception:
+            pass
+    # cleanup owned ollama scrub proxy (exact PID only)
+    if scrub_proc is not None:
+        try:
+            if scrub_proc.poll() is None:
+                scrub_proc.terminate()
         except Exception:
             pass
     return proc.returncode

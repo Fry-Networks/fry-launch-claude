@@ -5,8 +5,10 @@ Launched as owned child by fry for grok/codex --model in claude router.
 """
 import http.server
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import shutil
@@ -24,17 +26,24 @@ def _strip_ansi(txt):
 def run_cli(prompt, model):
     target = "grok" if "grok" in model.lower() else "codex"
     exe = GROK_EXE if target == "grok" else CODEX_EXE
-    if target == "grok":
-        args = [exe, "-p", prompt, "-m", model, "--output-format", "plain"]
-    else:
-        args = [exe, "exec", "--skip-git-repo-check", prompt, "-m", model]
+    tmp_path = None
     try:
+        if target == "grok":
+            fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="fry_grok_", text=True)
+            os.write(fd, prompt.encode("utf-8"))
+            os.close(fd)
+            args = [exe, "--prompt-file", tmp_path, "-m", model, "--output-format", "plain"]
+            stdin_arg, input_arg = subprocess.DEVNULL, None
+        else:
+            args = [exe, "exec", "--skip-git-repo-check", "-", "-m", model]
+            stdin_arg, input_arg = None, prompt   # input= creates the pipe; do NOT pass stdin=PIPE
         proc = subprocess.run(
             args,
             capture_output=True,
             timeout=180,
             text=True,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_arg,
+            input=input_arg,
             creationflags=0x08000000 if sys.platform == "win32" else 0,
         )
         if proc.returncode == 0:
@@ -43,6 +52,12 @@ def run_cli(prompt, model):
         return _strip_ansi(f"[cli error rc={proc.returncode}] {out.strip()}")
     except Exception as e:
         return f"[bridge error] {e}"
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 class BridgeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -91,7 +106,15 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(c, str):
                         prompt = c
                     elif isinstance(c, list):
-                        prompt = c[0].get("text", "") if c and isinstance(c[0], dict) else str(c)
+                        parts = []
+                        for part in c:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                parts.append(part.get("text", ""))
+                            elif isinstance(part, dict) and "text" in part:
+                                parts.append(part["text"])
+                            elif isinstance(part, str):
+                                parts.append(part)
+                        prompt = "\n".join(parts)
                     else:
                         prompt = str(c)
                     break
