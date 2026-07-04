@@ -43,10 +43,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import copy
 import hashlib
 from pathlib import Path
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
 DEFAULT_CONFIG_PATH = FRY_HOME / "config.json"
@@ -491,6 +492,57 @@ def validate_openai_compat_model(base_url, api_key, model_id, timeout=15):
 # --------------------------------------------------------------------------- #
 FRY_MODEL_MARKER = " (router)"
 
+PROVIDER_REGISTRY = {
+    "anthropic": {
+        "displayName": "Anthropic / Claude",
+        "billingProvider": "Anthropic",
+        "launchMode": "native",
+        "status": "active",
+        "statusReason": "",
+        "presetModels": ["claude-opus-4-6", "claude-sonnet-4-6"],
+    },
+    "ollama": {
+        "displayName": "Ollama (Local + Cloud)",
+        "billingProvider": "Ollama",
+        "launchMode": "both",
+        "status": "active",
+        "statusReason": "",
+        "presetModels": [],
+    },
+    "deepseek-direct": {
+        "displayName": "DeepSeek Direct API",
+        "billingProvider": "DeepSeek API",
+        "launchMode": "native",
+        "status": "needs_credential",
+        "statusReason": "Set secret to op:// URI for your DeepSeek API key from platform.deepseek.com",
+        "presetModels": ["deepseek-v4-pro[1m]", "deepseek-v4-pro", "deepseek-v4-flash"],
+    },
+    "openai": {
+        "displayName": "Codex",
+        "billingProvider": "Codex CLI / stored auth",
+        "launchMode": "both",
+        "status": "active",
+        "statusReason": "",
+        "presetModels": ["gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini"],
+    },
+    "xai": {
+        "displayName": "Grok",
+        "billingProvider": "Grok CLI / stored auth",
+        "launchMode": "both",
+        "status": "active",
+        "statusReason": "",
+        "presetModels": ["grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning"],
+    },
+    "openrouter": {
+        "displayName": "OpenRouter",
+        "billingProvider": "OpenRouter",
+        "launchMode": "both",
+        "status": "needs_credential",
+        "statusReason": "Set secret or credentials for OPENROUTER_API_KEY",
+        "presetModels": ["anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6"],
+    },
+}
+
 
 def router_provider_models(pname, prouter, expand_key=None):
     """Return the model list for a router provider, expanding dynamically.
@@ -583,7 +635,7 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     kept = [e for e in old_cache
             if isinstance(e, dict)
             and not e.get("description", "").endswith(FRY_MODEL_MARKER)
-            and not (e.get("value", "").startswith("xai,") or e.get("value", "").startswith("openai,") or e.get("value", "").startswith("fry-grok,") or e.get("value", "").startswith("fry-codex,"))]
+            and not (e.get("value", "").startswith("xai,") or e.get("value", "").startswith("openai,") or e.get("value", "").startswith("fry-grok") or e.get("value", "").startswith("fry-codex") or e.get("value", "").startswith("ollama,") or e.get("value", "").startswith("local-ollama,"))]
 
     seen = set()
     merged = []
@@ -602,7 +654,7 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     # Sanitize stale selectedModel (the root cause of "issue with the selected model (xai,grok-4.3)"
     # even after additionalModelOptionsCache clean). Force to the ollama local form or remove.
     sel = claude_data.get("selectedModel")
-    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok,") or sel.startswith("fry-codex,") or sel == "xai,grok-4.3"):
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
         preferred = None
         for e in merged:
             if e.get("value") in ("ollama,fry-grok-4-3", "ollama,llama3.2:3b"):
@@ -844,6 +896,22 @@ def _kill_stale_ccr(router_port=3456):
             print(proc.stdout.strip(), file=sys.stderr)
     except Exception as e:
         warn(f"stale ccr command-line cleanup failed (non-fatal): {e}")
+    # Also reap orphaned node processes left by prior CCR spawns
+    try:
+        ps_cmd_node = (
+            "Get-WmiObject Win32_Process | "
+            "Where-Object { $_.CommandLine -like '*claude-code-router*' -and $_.Name -eq 'node.exe' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
+            'Write-Host "killed stale node PID $($_.ProcessId)" }'
+        )
+        proc = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd_node],
+            capture_output=True, text=True,
+        )
+        if proc.stdout:
+            print(proc.stdout.strip(), file=sys.stderr)
+    except Exception as e:
+        warn(f"stale node cleanup failed (non-fatal): {e}")
     # Classic netstat/taskkill fallback
     try:
         ns = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
@@ -950,6 +1018,50 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     _kill_stale_bridge_processes("local_auth_bridge.py")
     _kill_stale_bridge_processes("ollama_scrub_proxy.py")
     _kill_stale_ccr(cfg.get("router", {}).get("port", 3456))
+
+    # Capture clean baselines before launch writes anything
+    clean_ccr_dict = copy.deepcopy(ccr_dict)
+    claude_json_path = Path.home() / ".claude.json"
+    if claude_json_path.exists():
+        clean_claude = json.loads(claude_json_path.read_text(encoding="utf-8-sig"))
+    else:
+        clean_claude = {}
+    clean_claude["additionalModelOptionsCache"] = [
+        e for e in clean_claude.get("additionalModelOptionsCache", [])
+        if isinstance(e, dict)
+        and not e.get("description", "").endswith(FRY_MODEL_MARKER)
+        and not any(e.get("value", "").startswith(p) for p in ("xai,", "openai,", "fry-grok", "fry-codex", "ollama,", "local-ollama,"))
+    ]
+    sel = clean_claude.get("selectedModel")
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
+        clean_claude.pop("selectedModel", None)
+    settings_json_path = Path.home() / ".claude" / "settings.json"
+    if settings_json_path.exists():
+        with open(settings_json_path, "r", encoding="utf-8") as f:
+            clean_settings = json.load(f)
+    else:
+        clean_settings = {}
+    sm = clean_settings.get("model")
+    if isinstance(sm, str) and (sm.startswith("fry-grok") or sm.startswith("fry-codex") or sm.startswith("ollama,") or sm.startswith("local-ollama,")):
+        clean_settings.pop("model", None)
+
+    def _restore_clean_baselines():
+        write_ccr_config(cfg, clean_ccr_dict)
+        claude_json_path.write_text(json.dumps(clean_claude, indent=2), encoding="utf-8")
+        settings_json_path.write_text(json.dumps(clean_settings, indent=2), encoding="utf-8")
+        if bridge_proc is not None:
+            try:
+                if bridge_proc.poll() is None:
+                    bridge_proc.terminate()
+            except Exception:
+                pass
+        if scrub_proc is not None:
+            try:
+                if scrub_proc.poll() is None:
+                    scrub_proc.terminate()
+            except Exception:
+                pass
+
     try:
         bridge_port = _find_free_port()
         bridge_py = Path(__file__).with_name("local_auth_bridge.py")
@@ -1060,7 +1172,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             original = txt
             # Excise colliding raw cache entries (xai/openai/fry-grok/fry-codex legacy).
             txt = re.sub(
-                r'\s*\{\s*"value"\s*:\s*"(xai,[^"]+|openai,[^"]+|fry-grok,[^"]+|fry-codex,[^"]+|xai,grok-4.3)"[^}]*\},?',
+                r'\s*\{\s*"value"\s*:\s*"(xai,[^"]+|openai,[^"]+|fry-grok[^"]*|fry-codex[^"]*|ollama,[^"]+|local-ollama,[^"]+|xai,grok-4.3)"[^}]*\},?',
                 "",
                 txt,
                 flags=re.IGNORECASE
@@ -1157,9 +1269,11 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         print(f"command   : ccr code {' '.join(passthrough)}".rstrip())
         inject_model_cache(ccr_dict, dry_run=True)
         print("(dry run: ccr config NOT written, nothing launched)")
+        _restore_clean_baselines()
         return 0
 
     if ccr_bin is None:
+        _restore_clean_baselines()
         die("claude-code-router 'ccr' not found. Install it with:\n"
             "    npm install -g @musistudio/claude-code-router\n"
             "then re-run. (fry will not auto-install.)")
@@ -1227,21 +1341,10 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     # so Claude Code sees the ollama provider and CCR routes to the live bridge.
     model_flag = ["--model", default_model] if default_model else []
     argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(passthrough))
-    proc = subprocess.run(argv, env=env)
-    # cleanup owned local-auth bridge (exact PID only, per safety rules)
-    if bridge_proc is not None:
-        try:
-            if bridge_proc.poll() is None:
-                bridge_proc.terminate()
-        except Exception:
-            pass
-    # cleanup owned ollama scrub proxy (exact PID only)
-    if scrub_proc is not None:
-        try:
-            if scrub_proc.poll() is None:
-                scrub_proc.terminate()
-        except Exception:
-            pass
+    try:
+        proc = subprocess.run(argv, env=env)
+    finally:
+        _restore_clean_baselines()
     return proc.returncode
 
 
@@ -1379,29 +1482,67 @@ def cmd_launch(cfg, args):
 
 
 def cmd_models(cfg, _args):
-    print("Routable <provider>,<model> strings (use in /model and for agent-team teammates):\n")
-    any_found = False
-    for pname, pcfg in cfg.get("providers", {}).items():
+    print("Provider Groups (use in /model or fry launch):\n")
+    providers = cfg.get("providers", {})
+
+    for pname, entry in PROVIDER_REGISTRY.items():
+        display = entry["displayName"]
+        billing = entry["billingProvider"]
+        status = entry["status"]
+        status_reason = entry["statusReason"]
+        launch_mode = entry["launchMode"]
+        presets = entry.get("presetModels", [])
+        pcfg = providers.get(pname, {})
+
+        status_badge = ""
+        if status == "needs_credential":
+            status_badge = f" [Needs credential]"
+        elif status == "blocked":
+            status_badge = f" [BLOCKED: {status_reason}]"
+        elif status == "not_installed":
+            status_badge = " [Not installed]"
+
+        print(f"{display}  -- Billing: {billing}{status_badge}")
+        if status == "needs_credential" and status_reason:
+            print(f"  > {status_reason}")
+
         prouter = pcfg.get("router")
-        if not prouter or not prouter.get("capable"):
-            continue
-        models = router_provider_models(pname, prouter)
-        if not models:
-            continue
-        any_found = True
-        note = "  (local)" if prouter.get("secret") is None else ""
-        print(f"{pname}{note}:")
-        for m in models:
-            print(f"  /model {pname},{m}")
+        has_router = launch_mode in ("both", "router") and prouter and prouter.get("capable")
+
+        if has_router:
+            models = router_provider_models(pname, prouter)
+            if models:
+                print(f"  Router models ({len(models)}):")
+                for m in models[:10]:
+                    billing_note = ""
+                    if pname == "ollama" and ":cloud" in str(m):
+                        billing_note = " (cloud -- Ollama billed)"
+                    print(f"    /model {pname},{m}{billing_note}")
+                if len(models) > 10:
+                    print(f"    ... +{len(models) - 10} more")
+
+        if not has_router and presets:
+            print(f"  Models:")
+            for m in presets:
+                print(f"    /model {pname},{m}")
+
+        native_agents = {k: v for k, v in pcfg.get("native", {}).items()
+                         if k != "default_model" and isinstance(v, dict)}
+        if native_agents:
+            agent = list(native_agents.keys())[0]
+            if has_router:
+                print(f"  Native: fry launch {agent} --native --provider {pname} [--model <model>]")
+            else:
+                print(f"  Launch: fry launch {agent} --native --provider {pname} --model <model>")
+        elif presets and not has_router:
+            print(f"  Launch: fry launch claude --native --provider {pname} --model <model>")
+
         print()
-    if not any_found:
-        print("(no router-capable providers configured)")
-    # explicit local stored-auth routes for Grok/Codex (the goal of this fix)
-    # these go through the local CLIs' stored auth (grok login / codex login), never raw xAI/OpenAI $ keys
+
     try:
         grok_bin = resolve_bin(["grok", "grok.cmd", "grok.exe"])
         if grok_bin and Path(grok_bin).exists():
-            print("grok (local stored-auth via Grok Build CLI - uses ~/.grok/auth.json):")
+            print("Grok / xAI -- Stored-auth (Grok Build CLI, ~/.grok/auth.json):")
             print("  /model grok,grok-4.3")
             print("  /model grok,grok-4.20-0309-reasoning")
             print("  /model grok,grok-4.20-0309-non-reasoning")
@@ -1411,7 +1552,7 @@ def cmd_models(cfg, _args):
     try:
         codex_bin = resolve_bin(["codex", "codex.cmd", "codex.exe"])
         if codex_bin:
-            print("codex (local stored-auth via Codex CLI/OAuth - uses ~/.codex/auth.json):")
+            print("Codex -- Stored-auth (Codex CLI/OAuth, ~/.codex/auth.json):")
             print("  /model codex,gpt-5.4-mini          (confirmed working)")
             print("  /model codex,gpt-5.4               (confirmed working)")
             print("  /model codex,gpt-4o-mini")
@@ -1419,11 +1560,6 @@ def cmd_models(cfg, _args):
             print()
     except Exception:
         pass
-    print("Native single-backend launches (subscription Anthropic, Codex, etc.):")
-    for aname, a in cfg.get("agents", {}).items():
-        for pname, pcfg in cfg.get("providers", {}).items():
-            if pcfg.get("native", {}).get(aname):
-                print(f"  fry launch {aname} --native --provider {pname} [--model ...]")
     return 0
 
 

@@ -255,6 +255,35 @@
           "env": {}
         }
       }
+    },
+    "deepseek-direct": {
+      "_note": "Direct DeepSeek API (separate billing from Ollama). Uses DeepSeek's Anthropic-compatible endpoint at api.deepseek.com/anthropic. Set secret to your op:// URI for your DeepSeek API key from platform.deepseek.com. Models: deepseek-v4-pro[1m], deepseek-v4-pro, deepseek-v4-flash.",
+      "secret": "op://YOUR_VAULT/YOUR_ITEM/YOUR_FIELD",
+      "default_model": "deepseek-v4-pro[1m]",
+      "router": {
+        "capable": false
+      },
+      "native": {
+        "default_model": "deepseek-v4-pro[1m]",
+        "claude": {
+          "requires_model": true,
+          "requires_key": true,
+          "clear_env": [
+            "ANTHROPIC_CUSTOM_HEADERS"
+          ],
+          "env": {
+            "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+            "ANTHROPIC_AUTH_TOKEN": "{api_key}",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "{model}",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+            "CLAUDE_CODE_EFFORT_LEVEL": "max"
+          }
+        }
+      }
     }
   }
 }
