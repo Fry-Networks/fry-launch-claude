@@ -23,7 +23,19 @@ def _strip_ansi(txt):
         return txt
     return _re.sub(r'\x1b\[[0-9;]*m', '', txt)
 
+WRAPPER_PREFIX = (
+    "Respond directly to the following request. "
+    "Do not enumerate files, skills, plugins, or workspace. "
+    "Do not ask for clarification. "
+    "Do not write code unless explicitly asked. "
+    "Your response should answer the request below concisely:\n\n"
+)
+
+def _adapt_user_prompt_for_cli(prompt):
+    return WRAPPER_PREFIX + prompt
+
 def run_cli(prompt, model):
+    prompt = _adapt_user_prompt_for_cli(prompt)
     target = "grok" if "grok" in model.lower() else "codex"
     exe = GROK_EXE if target == "grok" else CODEX_EXE
     tmp_path = None
@@ -32,7 +44,7 @@ def run_cli(prompt, model):
             fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="fry_grok_", text=True)
             os.write(fd, prompt.encode("utf-8"))
             os.close(fd)
-            args = [exe, "--prompt-file", tmp_path, "-m", model, "--output-format", "plain"]
+            args = [exe, "--prompt-file", tmp_path, "-m", model, "--no-alt-screen", "--output-format", "plain"]
             stdin_arg, input_arg = subprocess.DEVNULL, None
         else:
             args = [exe, "exec", "--skip-git-repo-check", "-", "-m", model]
@@ -40,7 +52,7 @@ def run_cli(prompt, model):
         proc = subprocess.run(
             args,
             capture_output=True,
-            timeout=180,
+            timeout=120,
             text=True,
             stdin=stdin_arg,
             input=input_arg,
@@ -50,6 +62,8 @@ def run_cli(prompt, model):
             return _strip_ansi(proc.stdout.strip())
         out = (proc.stdout or "") + (proc.stderr or "")
         return _strip_ansi(f"[cli error rc={proc.returncode}] {out.strip()}")
+    except subprocess.TimeoutExpired:
+        return "[bridge error] grok timed out after 120s"
     except Exception as e:
         return f"[bridge error] {e}"
     finally:

@@ -286,6 +286,142 @@ def list_openai_compatible_models(base_url, api_key=None, timeout=10, max_attemp
     return []
 
 
+# --------------------------------------------------------------------------- #
+# debug / redacted logging
+# --------------------------------------------------------------------------- #
+_debug_state = None
+
+
+def _debug_setup(args):
+    global _debug_state
+    if not getattr(args, "debug", None):
+        _debug_state = None
+        return
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    ddir = getattr(args, "debug_dir", None)
+    if ddir:
+        base = Path(ddir)
+    else:
+        base = Path(r"D:\Fry Networks\repos\fry\backups") / f"fry_debug_{ts}"
+    base.mkdir(parents=True, exist_ok=True)
+    _debug_state = {"dir": base, "entries": [], "start": time.time()}
+
+
+def _debug_log(**kwargs):
+    if _debug_state is None:
+        return
+    now = time.time()
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
+    entry = {"ts": ts_str}
+    for k, v in kwargs.items():
+        if v is None:
+            entry[k] = None
+        elif isinstance(v, str):
+            entry[k] = _redact(v)
+        elif isinstance(v, (list, tuple)):
+            entry[k] = [_redact(str(x)) for x in v]
+        elif isinstance(v, dict):
+            entry[k] = {_redact(str(kk)): _redact(str(vv)) for kk, vv in v.items()}
+        else:
+            entry[k] = str(v)
+    _debug_state["entries"].append(entry)
+
+
+def _debug_finalize(exit_code):
+    if _debug_state is None:
+        return
+    now = time.time()
+    elapsed = round(now - _debug_state["start"], 2)
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
+    _debug_state["entries"].append({
+        "ts": ts_str,
+        "event": "session_end",
+        "exit_code": exit_code,
+        "elapsed_s": elapsed,
+    })
+    log_path = _debug_state["dir"] / "debug.json"
+    log_path.write_text(json.dumps(_debug_state["entries"], indent=2), encoding="utf-8")
+    print(f"fry: debug log -> {log_path} ({len(_debug_state['entries'])} entries, {elapsed}s)",
+          file=sys.stderr)
+
+
+def _redact(s):
+    if not isinstance(s, str):
+        return str(s)
+    s = re.sub(r'op://[^\s"\'<>]+', "op://...", s)
+    s = re.sub(r'(sk-[a-zA-Z0-9]{8})[a-zA-Z0-9]+', r'\1<REDACTED>', s)
+    s = re.sub(r'(Bearer )[^\s"\'<>]+', r'\1<REDACTED>', s)
+    s = re.sub(r'(eyJ)[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,}){2,}', r'<JWT REDACTED>', s)
+    s = re.sub(r'OP_SESSION_[a-zA-Z0-9_-]{8,}', "<SESSION REDACTED>", s)
+    return s
+
+
+def _sanitize_argv_for_debug(argv):
+    bool_flags = {"--debug", "--native", "--router", "--dry-run", "--yes", "-y",
+                  "--no-alt-screen", "--skip-git-repo-check"}
+    prompt_flags = {"--print", "-p", "--prompt", "--message"}
+    prompt_file_flags = {"--prompt-file"}
+    safe_value_flags = {"--model", "-m", "--debug-dir", "--output-format", "--config",
+                        "--provider"}
+
+    result = list(argv)
+    try:
+        code_idx = result.index("code")
+    except ValueError:
+        code_idx = -1
+
+    i = 0
+    while i < len(result):
+        arg = result[i]
+        if i <= code_idx or code_idx == -1:
+            i += 1
+            continue
+
+        if arg in bool_flags:
+            i += 1
+            continue
+
+        if arg in prompt_file_flags:
+            if i + 1 < len(result):
+                result[i + 1] = "<prompt-file:redacted>"
+                i += 1
+            i += 1
+            continue
+
+        if arg in prompt_flags:
+            if i + 1 < len(result):
+                val = result[i + 1]
+                if isinstance(val, str):
+                    h = hashlib.sha256(val.encode("utf-8")).hexdigest()[:12]
+                    result[i + 1] = f"<prompt:redacted len={len(val)} sha256={h}>"
+                i += 1
+            i += 1
+            continue
+
+        if arg in safe_value_flags:
+            i += 2
+            continue
+
+        if arg.startswith("-"):
+            if i + 1 < len(result) and "," not in str(result[i + 1]):
+                val = result[i + 1]
+                if isinstance(val, str):
+                    h = hashlib.sha256(val.encode("utf-8")).hexdigest()[:12]
+                    result[i + 1] = f"<prompt:redacted len={len(val)} sha256={h}>"
+                i += 1
+            i += 1
+            continue
+
+        if "," not in arg:
+            if isinstance(arg, str):
+                h = hashlib.sha256(arg.encode("utf-8")).hexdigest()[:12]
+                result[i] = f"<prompt:redacted len={len(arg)} sha256={h}>"
+
+        i += 1
+
+    return result
+
+
 def discover_xai_key(reauth_if_needed=False):
     """Discover xAI API key. Priority:
     1. ~/.grok/auth.json — find JWT-shaped field, check expiry, test against xAI API
@@ -993,6 +1129,13 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         bridge_active=True,
     )
 
+    if _debug_state:
+        prov_names = [p["name"] for p in ccr_dict.get("Providers", [])]
+        _debug_log(event="ccr_config_compiled",
+                   providers=prov_names,
+                   default=ccr_dict["Router"].get("default"),
+                   env_export=[e["env_var"] for e in env_needed])
+
     ccr_bin = resolve_bin(["ccr", "ccr.cmd", "ccr.exe"])
 
     # Initialize env early for the entire router path so hygiene code and ANTHROPIC_ sets are safe
@@ -1087,7 +1230,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             warn("local bridge did not report ready; proceeding anyway")
         bridge_url = f"http://127.0.0.1:{bridge_port}/v1/chat/completions"
         # Replace any existing ollama provider with the bridge (Claude Code whitelist requires ollama name).
-        provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") != "ollama"]
+        provs = [p for p in ccr_dict.get("Providers", []) if p.get("name") not in ("ollama", "openai", "xai")]
         provs.append({
             "name": "ollama",
             "api_base_url": bridge_url,
@@ -1097,6 +1240,9 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         ccr_dict["Providers"] = provs
         # Always translate user-facing aliases so raw ollama,<model> hits local-ollama
         ccr_dict["Router"]["default"] = _fry_internal_model(model) if model else "ollama,fry-grok-4-3"
+        if _debug_state:
+            _debug_log(event="bridge_running", bridge_url=bridge_url,
+                       bridge_models=local_models, bridge_port=bridge_port)
     except Exception as e:
         warn(f"unified local bridge start failed: {e}; falling back (may hit raw key path)")
 
@@ -1341,6 +1487,16 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     # so Claude Code sees the ollama provider and CCR routes to the live bridge.
     model_flag = ["--model", default_model] if default_model else []
     argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(passthrough))
+    if _debug_state:
+        env_names = sorted(k for k in env.keys() if k != os.environ.get(k))
+        env_set = sorted(k for k in env.keys() if k in os.environ)
+        _debug_log(event="launch_child",
+                   argv=_sanitize_argv_for_debug(argv),
+                   ccr_bin=ccr_bin,
+                   default_model=default_model,
+                   passthrough_count=len(passthrough),
+                   env_names_set=env_set,
+                   credential_source="bridge-stored-auth" if bridge_proc else "ccr-provider")
     try:
         proc = subprocess.run(argv, env=env)
     finally:
@@ -1475,10 +1631,20 @@ def resolve_mode(cfg, agent, args):
 
 
 def cmd_launch(cfg, args):
+    _debug_setup(args)
+    if args.debug:
+        _debug_log(event="launch_start", agent=args.agent, model=args.model,
+                   provider=getattr(args, "provider", None),
+                   dry_run=args.dry_run, native=args.native, router=args.router)
     mode = resolve_mode(cfg, args.agent, args)
+    if _debug_state:
+        _debug_log(event="mode_resolved", mode=mode)
     if mode == "router":
-        return launch_router(cfg, args.agent, args.model, passthrough_global, args.dry_run)
-    return launch_native(cfg, args.agent, args.provider, args.model, args.dry_run)
+        rc = launch_router(cfg, args.agent, args.model, passthrough_global, args.dry_run)
+    else:
+        rc = launch_native(cfg, args.agent, args.provider, args.model, args.dry_run)
+    _debug_finalize(rc)
+    return rc
 
 
 def cmd_models(cfg, _args):
@@ -1679,6 +1845,8 @@ def build_parser():
     pl.add_argument("--router", action="store_true", help="force router (cross-provider) mode")
     pl.add_argument("--yes", "-y", action="store_true", help="skip interactive pickers")
     pl.add_argument("--dry-run", action="store_true", help="print what would happen; do nothing")
+    pl.add_argument("--debug", action="store_true", help="enable redacted debug logging")
+    pl.add_argument("--debug-dir", default=None, help="debug log directory (default: backups/fry_debug_<ts>/)")
 
     sub.add_parser("models", help="list routable <provider>,<model> strings + native launches")
     sub.add_parser("doctor", help="check tools, providers, ollama models")
