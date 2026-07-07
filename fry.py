@@ -5,7 +5,7 @@ fry -- unified launcher for coding agents across model providers.
 Same shape as `ollama launch claude`:
 
     fry launch claude
-    fry launch claude --model openrouter,anthropic/claude-sonnet-4.6
+    fry launch claude --model ollama,qwen3-coder:480b-cloud
     fry launch claude -- --dangerously-skip-permissions "do X"
 
 Two launch modes:
@@ -17,7 +17,7 @@ Two launch modes:
       and you can assign any of those strings to agent-team teammates.
       `fry models` prints every valid <provider>,<model> string.
       NOTE: a Claude Pro/Max *subscription* does NOT work through a router --
-      Anthropic models in router mode bill via API key or OpenRouter credits.
+      Anthropic models in router mode bill via API key.
       Use --native for subscription-backed Anthropic (single backend, Anthropic
       models only).
 
@@ -656,7 +656,7 @@ PROVIDER_REGISTRY = {
     "openai": {
         "displayName": "Codex",
         "billingProvider": "Codex CLI / stored auth",
-        "launchMode": "both",
+        "launchMode": "native",
         "status": "active",
         "statusReason": "",
         "presetModels": ["gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini"],
@@ -664,18 +664,26 @@ PROVIDER_REGISTRY = {
     "xai": {
         "displayName": "Grok",
         "billingProvider": "Grok CLI / stored auth",
-        "launchMode": "both",
+        "launchMode": "native",
         "status": "active",
         "statusReason": "",
         "presetModels": ["grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning"],
     },
-    "openrouter": {
-        "displayName": "OpenRouter",
-        "billingProvider": "OpenRouter",
+    "opencode": {
+        "displayName": "Opencode CLI",
+        "billingProvider": "Opencode Go CLI / local",
+        "launchMode": "native",
+        "status": "active",
+        "statusReason": "",
+        "presetModels": ["nemotron-3-ultra-free", "mimo-v2.5-free", "north-mini-code-free", "deepseek-v4-flash-free"],
+    },
+    "nvidia": {
+        "displayName": "NVIDIA NIM API",
+        "billingProvider": "NVIDIA",
         "launchMode": "both",
         "status": "needs_credential",
-        "statusReason": "Set secret or credentials for OPENROUTER_API_KEY",
-        "presetModels": ["anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6"],
+        "statusReason": "Set secret to op:// URI for your NVIDIA API key from build.nvidia.com",
+        "presetModels": ["nvidia/llama-3.1-nemotron-70b-instruct", "nvidia/nemotron-4-340b-instruct"],
     },
 }
 
@@ -771,7 +779,7 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     kept = [e for e in old_cache
             if isinstance(e, dict)
             and not e.get("description", "").endswith(FRY_MODEL_MARKER)
-            and not (e.get("value", "").startswith("xai,") or e.get("value", "").startswith("openai,") or e.get("value", "").startswith("fry-grok") or e.get("value", "").startswith("fry-codex") or e.get("value", "").startswith("ollama,") or e.get("value", "").startswith("local-ollama,"))]
+            and not (e.get("value", "").startswith("xai,") or e.get("value", "").startswith("openai,") or e.get("value", "").startswith("opencode,") or e.get("value", "").startswith("fry-grok") or e.get("value", "").startswith("fry-codex") or e.get("value", "").startswith("fry-opencode") or e.get("value", "").startswith("ollama,") or e.get("value", "").startswith("local-ollama,"))]
 
     seen = set()
     merged = []
@@ -790,7 +798,7 @@ def inject_model_cache(ccr_dict, claude_json_path=None, dry_run=False):
     # Sanitize stale selectedModel (the root cause of "issue with the selected model (xai,grok-4.3)"
     # even after additionalModelOptionsCache clean). Force to the ollama local form or remove.
     sel = claude_data.get("selectedModel")
-    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("opencode,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("fry-opencode") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
         preferred = None
         for e in merged:
             if e.get("value") in ("ollama,fry-grok-4-3", "ollama,llama3.2:3b"):
@@ -829,67 +837,37 @@ def compile_ccr_config(cfg, override_default=None, interactive_reauth=False, bri
             continue
 
         env_var = prouter.get("env_var")
-        discover = prouter.get("discover")
         expand_key = None
 
-        if discover == "xai":
-            env_var = env_var or "XAI_API_KEY"
-            # 1. live CLI auth source
-            key, source = discover_xai_key(reauth_if_needed=interactive_reauth)
+        if not env_var:
+            # keyless provider (e.g. local ollama)
+            api_key = prouter.get("literal_key", "not-needed")
+        else:
+            key = None
+            source = None
             if not key:
-                # 2. credentials.json / env var
+                # credentials.json / env var
                 key = resolve_local_secret(env_var, pname)
                 if key:
                     source = "local"
             if not key:
-                warn(f"router provider '{pname}': no auth — run 'grok login' or set {env_var} or use 'fry credentials set {pname}'.")
+                secret = prouter.get("secret") or pcfg.get("secret")
+                if secret:
+                    try:
+                        resolved = resolve_secret(secret)
+                    except SystemExit:
+                        warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
+                        dropped.add(pname)
+                        continue
+                    key = resolved
+                    source = secret
+            if not key:
+                warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
                 dropped.add(pname)
                 continue
             expand_key = key
             api_key = "$" + env_var
-            if source == "grok-cli":
-                env_needed.append({"env_var": env_var, "provider": pname, "source": "literal:" + key})
-            else:
-                env_needed.append({"env_var": env_var, "provider": pname, "source": source})
-        else:
-            if not env_var:
-                # keyless provider (e.g. local ollama)
-                api_key = prouter.get("literal_key", "not-needed")
-            else:
-                key = None
-                source = None
-                if pname == "openai":
-                    # 1. live CLI auth source
-                    key, source = discover_openai_key(reauth_if_needed=interactive_reauth)
-                if not key and source == "codex-cli-oauth-incompatible" and not bridge_active:
-                    warn(f"router provider '{pname}': Codex CLI auth detected (ChatGPT OAuth) but incompatible with router API-key path. Run 'codex login --with-api-key' or set {env_var}.")
-                if not key:
-                    # 2. credentials.json / env var
-                    key = resolve_local_secret(env_var, pname)
-                    if key:
-                        source = "local"
-                if not key:
-                    secret = prouter.get("secret") or pcfg.get("secret")
-                    if secret and secret.startswith("op://"):
-                        warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
-                        dropped.add(pname)
-                        continue
-                    elif secret:
-                        try:
-                            resolved = resolve_secret(secret)
-                        except SystemExit:
-                            warn(f"router provider '{pname}': secret {secret} could not be resolved; skipping it.")
-                            dropped.add(pname)
-                            continue
-                        key = resolved
-                        source = secret
-                if not key:
-                    warn(f"router provider '{pname}': no local credential for {env_var} at {CREDENTIALS_PATH}; skipping. Set it with 'fry credentials set {pname}' or 'fry credentials import-env {pname}'.")
-                    dropped.add(pname)
-                    continue
-                expand_key = key
-                api_key = "$" + env_var
-                env_needed.append({"env_var": env_var, "provider": pname, "source": source})
+            env_needed.append({"env_var": env_var, "provider": pname, "source": source})
 
         models = router_provider_models(pname, prouter, expand_key=expand_key)
         if not models:
@@ -1087,22 +1065,27 @@ def _fry_internal_model(m):
         return m
     # provider prefix: route everything through ollama (Claude Code does not
     # remote-validate ollama models, so colliding raw xai/openai short IDs pass).
-    if m.startswith("grok,") or m.startswith("codex,") or m.startswith("xai,") or m.startswith("openai,") or m.startswith("fry-grok,") or m.startswith("fry-codex,"):
+    if m.startswith("grok,") or m.startswith("codex,") or m.startswith("xai,") or m.startswith("openai,") or m.startswith("fry-grok,") or m.startswith("fry-codex,") or m.startswith("opencode,") or m.startswith("fry-opencode,"):
         p = "ollama,"
         mid = m.split(",", 1)[1]
+        is_opencode = m.startswith("opencode,") or m.startswith("fry-opencode,")
     elif m.startswith("ollama,"):
         mid = m.split(",", 1)[1]
-        if mid.startswith("fry-grok-") or mid.startswith("fry-codex-"):
+        if mid.startswith("fry-grok-") or mid.startswith("fry-codex-") or mid.startswith("fry-opencode-"):
             p = "ollama,"
         else:
             p = "local-ollama,"
+        is_opencode = mid.startswith("fry-opencode-")
     else:
         return m
     # model ID alias (short raw -> fry-local non-colliding) only when routed
     # through the local bridge provider. For local-ollama HTTP, pass raw IDs.
     if p == "ollama,":
+        if is_opencode:
+            if not mid.startswith("fry-opencode-"):
+                mid = "fry-opencode-" + mid
         # Grok: hardcoded (all variants → grok-build in bridge, dot-to-hyphen sanitized)
-        if mid == "grok-4.3":
+        elif mid == "grok-4.3":
             mid = "fry-grok-4-3"
         elif mid == "grok-4.20-0309-reasoning":
             mid = "fry-grok-4-20-0309-reasoning"
@@ -1155,7 +1138,9 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     dummy = "local-bridge-dummy"
     local_models = [
         "fry-grok-4-3", "fry-grok-4-20-0309-reasoning", "fry-grok-4-20-0309-non-reasoning",
-        "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini"
+        "fry-codex-gpt-4o-mini", "fry-codex-gpt-5.4", "fry-codex-gpt-5.4-mini",
+        "fry-opencode-nemotron-3-ultra-free", "fry-opencode-mimo-v2.5-free",
+        "fry-opencode-north-mini-code-free", "fry-opencode-deepseek-v4-flash-free"
     ]
     # Clean up any leftover bridge/CCR state from previous launches so we bind a fresh port.
     _kill_stale_bridge_processes("local_auth_bridge.py")
@@ -1176,7 +1161,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         and not any(e.get("value", "").startswith(p) for p in ("xai,", "openai,", "fry-grok", "fry-codex", "ollama,", "local-ollama,"))
     ]
     sel = clean_claude.get("selectedModel")
-    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
+    if isinstance(sel, str) and (sel.startswith("xai,") or sel.startswith("openai,") or sel.startswith("opencode,") or sel.startswith("fry-grok") or sel.startswith("fry-codex") or sel.startswith("fry-opencode") or sel.startswith("ollama,") or sel.startswith("local-ollama,") or sel == "xai,grok-4.3"):
         clean_claude.pop("selectedModel", None)
     settings_json_path = Path.home() / ".claude" / "settings.json"
     if settings_json_path.exists():
@@ -1185,7 +1170,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     else:
         clean_settings = {}
     sm = clean_settings.get("model")
-    if isinstance(sm, str) and (sm.startswith("fry-grok") or sm.startswith("fry-codex") or sm.startswith("ollama,") or sm.startswith("local-ollama,")):
+    if isinstance(sm, str) and (sm.startswith("fry-grok") or sm.startswith("fry-codex") or sm.startswith("fry-opencode") or sm.startswith("ollama,") or sm.startswith("local-ollama,")):
         clean_settings.pop("model", None)
 
     def _restore_clean_baselines():
@@ -1318,7 +1303,7 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             original = txt
             # Excise colliding raw cache entries (xai/openai/fry-grok/fry-codex legacy).
             txt = re.sub(
-                r'\s*\{\s*"value"\s*:\s*"(xai,[^"]+|openai,[^"]+|fry-grok[^"]*|fry-codex[^"]*|ollama,[^"]+|local-ollama,[^"]+|xai,grok-4.3)"[^}]*\},?',
+                r'\s*\{\s*"value"\s*:\s*"(xai,[^"]+|openai,[^"]+|opencode,[^"]+|fry-grok[^"]*|fry-codex[^"]*|fry-opencode[^"]*|ollama,[^"]+|local-ollama,[^"]+|xai,grok-4.3)"[^}]*\},?',
                 "",
                 txt,
                 flags=re.IGNORECASE
@@ -1412,7 +1397,31 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
         for prov in ccr_dict["Providers"]:
             print(f"            {prov['name']}: {len(prov['models'])} models "
                   f"(api_key={prov['api_key']})")
-        print(f"command   : ccr code {' '.join(passthrough)}".rstrip())
+        # Preview the EFFECTIVE passthrough (mirrors the NVIDIA MCP-scoping block
+        # below) so the dry-run command line matches what a real launch actually
+        # sends -- previously this printed the raw pre-injection passthrough,
+        # silently hiding the --bare/--strict-mcp-config/--mcp-config flags for
+        # NVIDIA-model launches.
+        _preview_default_model = ccr_dict["Router"].get("default", "")
+        _preview_passthrough = list(passthrough)
+        if _preview_default_model.startswith("nvidia,"):
+            _cleaned = []
+            _skip_next = False
+            for _arg in _preview_passthrough:
+                if _skip_next:
+                    _skip_next = False
+                    continue
+                if _arg == "--mcp-config":
+                    _skip_next = True
+                    continue
+                _cleaned.append(_arg)
+            _preview_passthrough = _cleaned
+            for _flag in ("--bare", "--strict-mcp-config"):
+                if _flag not in _preview_passthrough:
+                    _preview_passthrough.append(_flag)
+            _preview_passthrough.extend(["--mcp-config", '{"mcpServers":{}}'])
+        _preview_model_flag = ["--model", _preview_default_model] if _preview_default_model else []
+        print(f"command   : ccr code {' '.join(_preview_model_flag + _preview_passthrough)}".rstrip())
         inject_model_cache(ccr_dict, dry_run=True)
         print("(dry run: ccr config NOT written, nothing launched)")
         _restore_clean_baselines()
@@ -1437,6 +1446,16 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
             val = resolve_secret(source)
         if val:
             env[env_var] = val
+
+    # Export router provider env vars to os.environ so the CCR daemon (started below
+    # without env=) inherits them. CCR v2.0.0 config loader interpolates $VAR from
+    # process.env at load time; without this export the daemon sees the literal
+    # "$NVIDIA_API_KEY" and forwards it as Bearer -> 401.
+    for entry in env_needed:
+        env_var = entry["env_var"]
+        val = env.get(env_var)
+        if val:
+            os.environ[env_var] = val
 
     # Set default model for CC picker (this will be consistent with what hygiene set
     # for the safe local paths; for grok/codex the bridge branch already set the target).
@@ -1485,8 +1504,37 @@ def launch_router(cfg, agent_name, model, passthrough, dry_run):
     # Explicit --model before passthrough ensures CCR/Claude Code validate against
     # the active config. Pass the full provider-prefixed string (e.g. ollama,fry-grok-4-3)
     # so Claude Code sees the ollama provider and CCR routes to the live bridge.
+    # NVIDIA NIM enforces tool-name regex ^[a-zA-Z0-9_-]{1,64}$. Claude Code CLI
+    # forwards 90+ MCP plugin tools with names exceeding this limit (e.g.
+    # mcp__plugin_microsoft-docs_microsoft-learn__microsoft_docs_search at 65
+    # chars). Inject --bare --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+    # to load zero MCP servers so only short built-in tool names reach NVIDIA.
+    # NVIDIA-scoped only; other providers (ollama, local-ollama) unaffected.
+    # User-provided --mcp-config is REMOVED for NVIDIA (must force empty config).
+    # Full NVIDIA agentic MCP/tool support DEFERRED.
+    effective_passthrough = list(passthrough)
+    if default_model.startswith("nvidia,"):
+        # Strip any existing --mcp-config <value> so NVIDIA always gets empty config.
+        _cleaned = []
+        _skip_next = False
+        for _arg in effective_passthrough:
+            if _skip_next:
+                _skip_next = False
+                continue
+            if _arg == "--mcp-config":
+                _skip_next = True
+                continue
+            _cleaned.append(_arg)
+        effective_passthrough = _cleaned
+        # Ensure --bare and --strict-mcp-config present once (idempotent).
+        for _flag in ("--bare", "--strict-mcp-config"):
+            if _flag not in effective_passthrough:
+                effective_passthrough.append(_flag)
+        # Append empty MCP config last so it wins.
+        effective_passthrough.extend(["--mcp-config", '{"mcpServers":{}}'])
+
     model_flag = ["--model", default_model] if default_model else []
-    argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(passthrough))
+    argv = wrap_for_windows(ccr_bin, ["code"] + model_flag + list(effective_passthrough))
     if _debug_state:
         env_names = sorted(k for k in env.keys() if k != os.environ.get(k))
         env_set = sorted(k for k in env.keys() if k in os.environ)
@@ -1726,6 +1774,18 @@ def cmd_models(cfg, _args):
             print()
     except Exception:
         pass
+    try:
+        opencode_bin = resolve_bin(["opencode", "opencode.cmd", "opencode.exe"])
+        if opencode_bin:
+            print("Opencode Go CLI -- Local free models (no auth needed):")
+            print("  /model opencode,nemotron-3-ultra-free")
+            print("  /model opencode,mimo-v2.5-free")
+            print("  /model opencode,north-mini-code-free")
+            print("  /model opencode,deepseek-v4-flash-free")
+            print("  /model opencode,<provider/model>    (any model your opencode CLI supports)")
+            print()
+    except Exception:
+        pass
     return 0
 
 
@@ -1785,7 +1845,7 @@ def cmd_credentials(cfg, args):
 def cmd_doctor(cfg, _args):
     print(f"fry {VERSION}")
     print(f"config: {cfg['__path__']}\n")
-    for tool in ("claude", "codex", "ccr", "ollama", "op"):
+    for tool in ("claude", "codex", "opencode", "ccr", "ollama", "op"):
         path = resolve_bin([tool, tool + ".cmd", tool + ".exe"])
         print(f"  {tool:8s} : {path or 'NOT FOUND'}")
     print(f"\n  agent teams env: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="

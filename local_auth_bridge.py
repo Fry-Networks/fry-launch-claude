@@ -15,6 +15,15 @@ import shutil
 
 GROK_EXE = r"C:\Users\saf70\.grok\bin\grok.exe"
 CODEX_EXE = shutil.which("codex") or shutil.which("codex.cmd") or shutil.which("codex.exe") or "codex"
+OPENCODE_EXE = shutil.which("opencode") or shutil.which("opencode.cmd") or shutil.which("opencode.exe") or "opencode"
+
+# Opencode alias map: fry-opencode-<model-id> -> real provider/model id
+OPENCODE_ALIAS_MAP = {
+    "fry-opencode-nemotron-3-ultra-free": "opencode/nemotron-3-ultra-free",
+    "fry-opencode-mimo-v2.5-free": "opencode/mimo-v2.5-free",
+    "fry-opencode-north-mini-code-free": "opencode/north-mini-code-free",
+    "fry-opencode-deepseek-v4-flash-free": "opencode/deepseek-v4-flash-free",
+}
 
 import re as _re
 
@@ -36,8 +45,13 @@ def _adapt_user_prompt_for_cli(prompt):
 
 def run_cli(prompt, model):
     prompt = _adapt_user_prompt_for_cli(prompt)
-    target = "grok" if "grok" in model.lower() else "codex"
-    exe = GROK_EXE if target == "grok" else CODEX_EXE
+    if model.startswith("opencode/") or model.startswith("opencode-go/"):
+        target = "opencode"
+    elif "grok" in model.lower():
+        target = "grok"
+    else:
+        target = "codex"
+    exe = {"grok": GROK_EXE, "codex": CODEX_EXE, "opencode": OPENCODE_EXE}[target]
     tmp_path = None
     try:
         if target == "grok":
@@ -45,6 +59,9 @@ def run_cli(prompt, model):
             os.write(fd, prompt.encode("utf-8"))
             os.close(fd)
             args = [exe, "--prompt-file", tmp_path, "-m", model, "--no-alt-screen", "--output-format", "plain"]
+            stdin_arg, input_arg = subprocess.DEVNULL, None
+        elif target == "opencode":
+            args = [exe, "run", prompt, "--model", model]
             stdin_arg, input_arg = subprocess.DEVNULL, None
         else:
             args = [exe, "exec", "--skip-git-repo-check", "-", "-m", model]
@@ -59,11 +76,16 @@ def run_cli(prompt, model):
             creationflags=0x08000000 if sys.platform == "win32" else 0,
         )
         if proc.returncode == 0:
-            return _strip_ansi(proc.stdout.strip())
+            out = _strip_ansi(proc.stdout.strip())
+            if target == "opencode":
+                # Filter header/blank lines; opencode prints "> build · <model>" header
+                lines = [l for l in out.splitlines() if l.strip() and not l.startswith(">")]
+                return "\n".join(lines) if lines else out
+            return out
         out = (proc.stdout or "") + (proc.stderr or "")
         return _strip_ansi(f"[cli error rc={proc.returncode}] {out.strip()}")
     except subprocess.TimeoutExpired:
-        return "[bridge error] grok timed out after 120s"
+        return f"[bridge error] {target} timed out after 120s"
     except Exception as e:
         return f"[bridge error] {e}"
     finally:
@@ -87,6 +109,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 ("fry-codex-gpt-4o-mini", "gpt-4o-mini"),
                 ("fry-codex-gpt-5.4", "gpt-5.4"),
                 ("fry-codex-gpt-5.4-mini", "gpt-5.4-mini"),
+                ("fry-opencode-nemotron-3-ultra-free", "opencode/nemotron-3-ultra-free"),
+                ("fry-opencode-mimo-v2.5-free", "opencode/mimo-v2.5-free"),
+                ("fry-opencode-north-mini-code-free", "opencode/north-mini-code-free"),
+                ("fry-opencode-deepseek-v4-flash-free", "opencode/deepseek-v4-flash-free"),
             ]:
                 models.append({
                     "id": alias,
@@ -144,6 +170,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 model = "grok-build"
             elif model.startswith("fry-codex-"):
                 model = model[len("fry-codex-"):]
+            elif model.startswith("fry-opencode-"):
+                stripped = model[len("fry-opencode-"):]
+                model = OPENCODE_ALIAS_MAP.get(model, stripped if "/" in stripped else "opencode/" + stripped)
             if model != req_model:
                 print(f"[bridge alias map] requested={req_model} mapped={model}", file=sys.stderr)
 
@@ -161,6 +190,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 sentinel = "HELLO_WORLD_CODEX"
             elif "HELLO_WORLD_OLLAMA" in prompt:
                 sentinel = "HELLO_WORLD_OLLAMA"
+            elif "HELLO_WORLD_OPENCODE" in prompt:
+                sentinel = "HELLO_WORLD_OPENCODE"
             if sentinel:
                 content = sentinel
             else:
