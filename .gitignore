@@ -6,3 +6,6 @@ __pycache__/
 config.json
 .fry/
 .DS_Store
+.env
+.env.local
+.env.*.local
