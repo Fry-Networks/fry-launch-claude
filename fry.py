@@ -1807,7 +1807,29 @@ def cmd_router(cfg, args):
     return proc.returncode
 
 
+def _mask_secret(val):
+    """Masked representation of a secret: '****' + last 4 chars. Never reveals
+    more than the trailing 4 characters."""
+    if not val:
+        return "(empty)"
+    return "****" + val[-4:] if len(val) >= 4 else "****"
+
+
 def cmd_credentials(cfg, args):
+    sub = args.credentials_cmd
+
+    # `list` needs no provider argument -- show every stored key, masked.
+    if sub == "list":
+        creds = load_credentials()
+        if not creds:
+            print(f"fry: no credentials stored at {CREDENTIALS_PATH}")
+            return 0
+        print(f"credentials ({CREDENTIALS_PATH}):")
+        for k in sorted(creds):
+            print(f"  {k}: {_mask_secret(creds[k])}")
+        return 0
+
+    # set / import-env / remove all resolve a provider -> env_var.
     providers = cfg.get("providers", {})
     pname = args.provider_name
     if pname not in providers:
@@ -1823,16 +1845,35 @@ def cmd_credentials(cfg, args):
     if not env_var:
         die(f"provider '{pname}' has no env_var configured.")
 
-    if args.credentials_cmd == "set":
-        val = mask_input(f"Enter API key for {pname}: ")
+    if sub == "remove":
+        creds = load_credentials()
+        if env_var in creds:
+            del creds[env_var]
+            save_credentials(creds)
+            print(f"fry: removed credential for {pname} (env_var={env_var})",
+                  file=sys.stderr)
+        else:
+            print(f"fry: no stored credential for {pname} (env_var={env_var})",
+                  file=sys.stderr)
+        return 0
+
+    if sub == "set":
+        # `keys set <provider> [key]` may pass an inline key; `credentials set`
+        # has no such positional, so getattr falls back to the masked prompt.
+        val = getattr(args, "key", None)
+        if val:
+            warn("inline key may be saved in shell history; prefer masked "
+                 "'fry keys set <provider>' or 'fry keys import-env <provider>'.")
+        else:
+            val = mask_input(f"Enter API key for {pname}: ")
         if not val:
             die("no key provided.")
-    elif args.credentials_cmd == "import-env":
+    elif sub == "import-env":
         val = os.environ.get(env_var)
         if not val:
             die(f"env var '{env_var}' is not set in this shell.")
     else:
-        die(f"unknown credentials subcommand '{args.credentials_cmd}'.")
+        die(f"unknown credentials subcommand '{sub}'.")
 
     creds = load_credentials()
     creds[env_var] = val
@@ -1917,12 +1958,24 @@ def build_parser():
                     help="router action; 'config' prints the compiled ccr config")
     pr.add_argument("--write", action="store_true", help="for 'config': write it to the ccr config path")
 
+    def _add_key_subcommands(parent, inline_set_key=False):
+        ks = parent.add_subparsers(dest="credentials_cmd", required=True)
+        s = ks.add_parser("set", help="store a provider key (masked prompt)")
+        s.add_argument("provider_name", help="provider id, e.g. openai or xai")
+        if inline_set_key:
+            s.add_argument("key", nargs="?", default=None,
+                           help="optional inline key (WARNING: may hit shell history)")
+        ie = ks.add_parser("import-env", help="import a provider key from the current environment")
+        ie.add_argument("provider_name", help="provider id, e.g. openai or xai")
+        rm = ks.add_parser("remove", help="remove a stored provider key")
+        rm.add_argument("provider_name", help="provider id, e.g. openai or xai")
+        ks.add_parser("list", help="list stored keys (masked)")
+
     pc = sub.add_parser("credentials", help="manage local provider credentials")
-    pc_sub = pc.add_subparsers(dest="credentials_cmd", required=True)
-    pc_set = pc_sub.add_parser("set", help="store a provider key interactively")
-    pc_set.add_argument("provider_name", help="provider id, e.g. openai or xai")
-    pc_imp = pc_sub.add_parser("import-env", help="import a provider key from the current environment")
-    pc_imp.add_argument("provider_name", help="provider id, e.g. openai or xai")
+    _add_key_subcommands(pc, inline_set_key=False)
+
+    pk = sub.add_parser("keys", help="manage local provider API keys (alias of credentials)")
+    _add_key_subcommands(pk, inline_set_key=True)
 
     sub.add_parser("version", help="print fry version")
     return p
@@ -1950,6 +2003,7 @@ def main():
         "doctor": lambda: cmd_doctor(cfg, args),
         "list": lambda: cmd_list(cfg, args),
         "credentials": lambda: cmd_credentials(cfg, args),
+        "keys": lambda: cmd_credentials(cfg, args),
     }[args.cmd]()
 
 

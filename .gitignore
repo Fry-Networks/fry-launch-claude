@@ -4,5 +4,7 @@ __pycache__/
 *.bak.*
 *.fry-backup.*
 config.json
+credentials.json
+*keys*.json
 .fry/
 .DS_Store
