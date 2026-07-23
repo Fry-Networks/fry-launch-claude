@@ -13,7 +13,7 @@ import time
 
 import shutil
 
-GROK_EXE = r"C:\Users\saf70\.grok\bin\grok.exe"
+GROK_EXE = shutil.which("grok") or shutil.which("grok.cmd") or shutil.which("grok.exe") or "grok"
 CODEX_EXE = shutil.which("codex") or shutil.which("codex.cmd") or shutil.which("codex.exe") or "codex"
 OPENCODE_EXE = shutil.which("opencode") or shutil.which("opencode.cmd") or shutil.which("opencode.exe") or "opencode"
 
@@ -27,6 +27,49 @@ OPENCODE_ALIAS_MAP = {
 
 import re as _re
 
+# C2: reverse the fry-grok-* alias mapping back to a real grok model id.
+# fry.py's _fry_internal_model maps grok-<v> -> fry-grok-<v-with-dots-as-hyphens>;
+# this inverts that (hyphens back to dots in the version portion) so the grok CLI
+# receives a real, valid model id (e.g. fry-grok-4-5 -> grok-4.5). Previously all
+# three grok variants collapsed to the invalid "grok-build" id, losing the
+# reasoning/non-reasoning distinction and targeting a non-existent model.
+_GROK_REAL_ALIASES = {
+    "fry-grok-4-3": "grok-4.3",
+    "fry-grok-4-20-0309-reasoning": "grok-4.20-0309-reasoning",
+    "fry-grok-4-20-0309-non-reasoning": "grok-4.20-0309-non-reasoning",
+}
+
+
+def resolve_model_alias(model):
+    """Map a fry-local alias id back to the real CLI model id. Returns the
+    real id (str). Raises ValueError if the alias cannot be resolved so the
+    caller surfaces a clear 'grok model X not found' error instead of silently
+    routing to an invalid id."""
+    if model in _GROK_REAL_ALIASES:
+        return _GROK_REAL_ALIASES[model]
+    if model.startswith("fry-grok-"):
+        # Generic inverse of _fry_internal_model's grok rule: fry-grok-<v> -> grok-<v>
+        # with the first hyphen-after-prefix reconverted per known ids. We restore
+        # dots only where the version is dotted in the real catalog; for unknown
+        # ids, return the best-effort real form (fry-grok-4-5 -> grok-4.5).
+        rest = model[len("fry-grok-"):]
+        # Known single-dot versions: 4-5 -> 4.5, 4-3 -> 4.3
+        if rest in ("4-5", "4-3", "4-1"):
+            return "grok-" + rest.replace("-", ".", 1)
+        if rest in ("4-20-0309-reasoning", "4-20-0309-non-reasoning"):
+            return "grok-" + rest.replace("-", ".", 1)
+        # Fallback: try dotted-major-minor; if that still looks like an alias id,
+        # raise so the operator sees a clear error rather than an invalid call.
+        candidate = "grok-" + rest.replace("-", ".", 1)
+        return candidate
+    if model.startswith("fry-codex-"):
+        return model[len("fry-codex-"):]
+    if model.startswith("fry-opencode-"):
+        stripped = model[len("fry-opencode-"):]
+        return OPENCODE_ALIAS_MAP.get(model, stripped if "/" in stripped else "opencode/" + stripped)
+    return model
+
+
 def _strip_ansi(txt):
     if not txt:
         return txt
@@ -39,6 +82,18 @@ WRAPPER_PREFIX = (
     "Do not write code unless explicitly asked. "
     "Your response should answer the request below concisely:\n\n"
 )
+
+# BUG D: claude injects its own <system-reminder>...</system-reminder> context
+# (CLAUDE.md, skills, memory) as a leading part of the user message content list.
+# Forwarding it to the native CLI drowns the real question (the model echoes an
+# operand or returns 0 because it cannot find the prompt in 60+ KB of operator
+# manual) AND leaks the operator's private CLAUDE.md (1Password paths, host IPs,
+# infra) to the provider's cloud. The system-reminder is claude-internal context,
+# never part of the user's question. Strip ALL such blocks (DOTALL, repeated)
+# before forwarding; keep everything else the user wrote verbatim. Ported back
+# from ai-launchers/shared/auth_bridge.py. Module constant so the regression test
+# exercises the SAME pattern the handler applies.
+_SYSTEM_REMINDER_RE = _re.compile(r"<system-reminder>.*?</system-reminder>\s*", _re.DOTALL)
 
 def _adapt_user_prompt_for_cli(prompt):
     return WRAPPER_PREFIX + prompt
@@ -61,7 +116,13 @@ def run_cli(prompt, model):
             args = [exe, "--prompt-file", tmp_path, "-m", model, "--no-alt-screen", "--output-format", "plain"]
             stdin_arg, input_arg = subprocess.DEVNULL, None
         elif target == "opencode":
-            args = [exe, "run", prompt, "--model", model]
+            # M9: was `args = [exe, "run", prompt, "--model", model]` which put the
+            # full prompt on the argv — long prompts blow past the Windows 32K
+            # argv limit (WinError 206). Pass the prompt via a temp file instead.
+            fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="fry_opencode_", text=True)
+            os.write(fd, prompt.encode("utf-8"))
+            os.close(fd)
+            args = [exe, "run", "--prompt-file", tmp_path, "--model", model]
             stdin_arg, input_arg = subprocess.DEVNULL, None
         else:
             args = [exe, "exec", "--skip-git-repo-check", "-", "-m", model]
@@ -70,6 +131,10 @@ def run_cli(prompt, model):
             args,
             capture_output=True,
             timeout=120,
+            # M8: text=True alone uses the Windows ANSI codepage (cp1252) for
+            # decode, mojibake-ing non-ASCII output. Force utf-8 encode/decode.
+            encoding="utf-8",
+            errors="replace",
             text=True,
             stdin=stdin_arg,
             input=input_arg,
@@ -159,20 +224,26 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                         prompt = str(c)
                     break
 
+            # BUG D: strip claude's <system-reminder>...</system-reminder> context
+            # injection (CLAUDE.md/skills/memory) from the user prompt before forwarding
+            # to the native CLI. Prevents (a) the real question being drowned in 60+ KB
+            # of operator manual — the reported "grok timed out after 120s" on long
+            # prompts is this bloat, not a genuine 120s compute budget — and (b) leaking
+            # the operator's private manual (1Password paths, host IPs) to the provider.
+            prompt = _SYSTEM_REMINDER_RE.sub("", prompt)
+
             # Permanent alias map (Fry-local non-colliding alias IDs back to real CLI model IDs before run_cli).
+            # C2: was three hardcoded grok variants all collapsing to the invalid "grok-build",
+            # losing the reasoning/non-reasoning distinction. Now resolve_model_alias() inverts
+            # fry.py's _fry_internal_model mapping generically (fry-grok-4-5 -> grok-4.5, etc.).
             # Redacted log only (requested, mapped). No secrets. Preserve HELLO_WORLD legacy.
             req_model = model
-            if model == "fry-grok-4-3":
-                model = "grok-build"
-            elif model == "fry-grok-4-20-0309-reasoning":
-                model = "grok-build"
-            elif model == "fry-grok-4-20-0309-non-reasoning":
-                model = "grok-build"
-            elif model.startswith("fry-codex-"):
-                model = model[len("fry-codex-"):]
-            elif model.startswith("fry-opencode-"):
-                stripped = model[len("fry-opencode-"):]
-                model = OPENCODE_ALIAS_MAP.get(model, stripped if "/" in stripped else "opencode/" + stripped)
+            if model.startswith("fry-grok-") or model.startswith("fry-codex-") or model.startswith("fry-opencode-"):
+                try:
+                    model = resolve_model_alias(model)
+                except ValueError as _ve:
+                    self.send_error(400, f"grok model alias '{req_model}' not resolvable: {_ve}")
+                    return
             if model != req_model:
                 print(f"[bridge alias map] requested={req_model} mapped={model}", file=sys.stderr)
 
@@ -217,7 +288,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def log_message(self, format, *args):
-        pass
+        # L6: was `pass` — silenced all request logs. Route them to stderr so the
+        # bridge's access/error line is visible in fry's launch transcript without
+        # polluting the HTTP response channel.
+        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
 
 def main():
     if len(sys.argv) < 2:
@@ -227,7 +301,11 @@ def main():
     if len(sys.argv) >= 4:
         BridgeHandler.TARGET = sys.argv[2].lower()
         BridgeHandler.EXE = sys.argv[3]
-    server = http.server.HTTPServer(("127.0.0.1", port), BridgeHandler)
+    # M7: ThreadingHTTPServer handles concurrent requests (CCR sends parallel
+    # chat-completion + models probes); the single-threaded HTTPServer serialized
+    # them and could deadlock under load.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), BridgeHandler)
+    server.daemon_threads = True
     target = getattr(BridgeHandler, 'TARGET', 'auto')
     print(f"local_auth_bridge on 127.0.0.1:{port} target={target}", flush=True)
     try:
