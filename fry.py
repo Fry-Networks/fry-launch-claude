@@ -47,6 +47,20 @@ import copy
 import hashlib
 from pathlib import Path
 
+# --- Sidecar modernization (additive; subscription providers route through a
+# shared raine/routatic sidecar with full Anthropic protocol fidelity instead
+# of the flattening CCR+auth_bridge path). Sibling modules live next to fry.py. ---
+try:  # pragma: no cover - import guard
+    import fry_anthropic_router as _sidecar_router
+except ImportError:  # pragma: no cover
+    _FRY_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _FRY_DIR not in sys.path:
+        sys.path.insert(0, _FRY_DIR)
+    try:
+        import fry_anthropic_router as _sidecar_router
+    except ImportError:
+        _sidecar_router = None
+
 VERSION = "0.3.4"
 
 FRY_HOME = Path(os.environ.get("FRY_HOME", Path.home() / ".fry"))
@@ -1687,6 +1701,51 @@ def cmd_launch(cfg, args):
     mode = resolve_mode(cfg, args.agent, args)
     if _debug_state:
         _debug_log(event="mode_resolved", mode=mode)
+
+    # --- Additive sidecar interception (modernization). In router mode, if the
+    # selected provider is a subscription-backed provider (openai=Codex/ChatGPT,
+    # xai=Grok, kimi=Kimi via raine; opencode via routatic), route through the
+    # shared sidecar with FULL Anthropic protocol fidelity — no flattening, no
+    # CCR/bridge sanitize-restore dance, no .claude.json/settings mutation. Non-
+    # subscription providers (ollama/deepseek-direct/nvidia/anthropic) and any
+    # opencode launch without a routatic key fall through to the legacy path. ---
+    if mode == "router" and _sidecar_router is not None and args.agent == "claude":
+        _prov = None
+        if args.model and "," in args.model:
+            _prov = args.model.split(",", 1)[0].strip()
+        elif getattr(args, "provider", None):
+            _prov = args.provider.strip()
+        if _prov in ("openai", "xai", "kimi"):
+            try:
+                rc = _sidecar_router.launch_via_sidecar(
+                    cfg, args.agent, args.model, passthrough_global,
+                    dry_run=args.dry_run, provider=_prov)
+                _debug_finalize(rc)
+                return rc
+            except KeyboardInterrupt:
+                _debug_finalize(130)
+                return 130
+            except Exception as e:
+                print(f"fry: sidecar launch failed for '{_prov}' ({e}); "
+                      f"falling back to legacy router path.", file=sys.stderr)
+        # opencode via routatic: integrated but gated on ROUTATIC_PROXY_API_KEY.
+        # If absent, fall through to legacy and surface AUTH_ACTION_REQUIRED.
+        elif _prov == "opencode" and os.environ.get("ROUTATIC_PROXY_API_KEY"):
+            try:
+                rc = _sidecar_router.launch_via_sidecar(
+                    cfg, args.agent, args.model, passthrough_global,
+                    dry_run=args.dry_run, provider="opencode")
+                _debug_finalize(rc)
+                return rc
+            except Exception as e:
+                print(f"fry: routatic sidecar launch failed ({e}); "
+                      f"falling back to legacy router path.", file=sys.stderr)
+        elif _prov == "opencode" and not os.environ.get("ROUTATIC_PROXY_API_KEY"):
+            print("fry: opencode via routatic sidecar requires ROUTATIC_PROXY_API_KEY "
+                  "(OpenCode Go API key). Set it to use the modernized path; "
+                  "falling back to legacy router for this launch. "
+                  "[AUTH_ACTION_REQUIRED for routatic live E2E]", file=sys.stderr)
+
     if mode == "router":
         rc = launch_router(cfg, args.agent, args.model, passthrough_global, args.dry_run)
     else:
