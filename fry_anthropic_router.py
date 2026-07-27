@@ -20,7 +20,10 @@ plugin state -> NO restore logic is required on this path.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,13 +42,130 @@ RAINE_PROVIDERS = {"openai": "codex", "xai": "grok", "kimi": "kimi",
                    "codex": "codex", "grok": "grok"}
 ROUTATIC_PROVIDERS = {"opencode"}
 
-# Claude Code executable — resolve the authoritative one from PATH. We never
-# prepend behavioral instructions and never consume slash commands.
+# Deprecated module-level cache of the Claude binary. Kept only for backward
+# compatibility with any external importer; the fixed launch path NEVER uses
+# this — it calls _resolve_claude_invocation() at launch time so changing
+# FRY_CLAUDE_BIN / PATH between launches takes effect (no frozen global cache).
 CLAUDE_BIN = os.environ.get("FRY_CLAUDE_BIN", "claude")
 
 
 class RouterError(RuntimeError):
     pass
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _inspect_cmd_shim(shim_path: str):
+    """Read-only inspection of an npm-style `claude.cmd` shim.
+
+    Returns (node_path, script_path) if the shim matches the trusted pattern
+    (`set "_prog=%~dp0...node.exe"` + `"%_prog%" "%~dp0...cli.js" %*`), else None.
+    Never executes the shim; only parses its text. Both resolved paths must
+    exist on disk.
+    """
+    try:
+        text = Path(shim_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    shim_dir = Path(shim_path).parent
+    # node.exe reference: `set "_prog=%~dp0node.exe"` OR `"%~dp0...node.exe"`
+    node_match = re.search(r'%~dp0([^"\s]*node\.exe)', text)
+    if not node_match:
+        node_match = re.search(r'set\s+"_prog=%~dp0([^"\s]+)"', text)
+    script_match = re.search(r'%~dp0([^"\s]*cli\.js)', text)
+    if not node_match or not script_match:
+        return None
+    try:
+        node_path = (shim_dir / node_match.group(1)).resolve(strict=False)
+        script_path = (shim_dir / script_match.group(1)).resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+    if not node_path.exists() or not script_path.exists():
+        return None
+    return str(node_path), str(script_path)
+
+
+def _fresh_spec(argv_prefix, resolved_kind, resolved_command_path,
+                node_path=None, script_path=None):
+    """Build a fresh immutable-ish spec dict (caller gets a new object each call)."""
+    spec = {
+        "argv_prefix": list(argv_prefix),
+        "resolved_kind": resolved_kind,
+        "resolved_command_path": resolved_command_path,
+        "resolved_command_sha256": _sha256_file(resolved_command_path),
+        "node_path": None,
+        "node_sha256": None,
+        "script_path": None,
+        "script_sha256": None,
+    }
+    if node_path:
+        spec["node_path"] = node_path
+        spec["node_sha256"] = _sha256_file(node_path)
+    if script_path:
+        spec["script_path"] = script_path
+        spec["script_sha256"] = _sha256_file(script_path)
+    return spec
+
+
+def _resolve_claude_invocation(user_env=None):
+    """Resolve the Claude Code launcher to an immutable launch spec, at launch time.
+
+    Resolution order (first wins, no global cache):
+      1. explicit FRY_CLAUDE_BIN (absolute path; must exist)
+      2. shutil.which on PATH (PATHEXT-aware: claude.exe / claude.cmd)
+
+    A `.cmd` shim is INSPECTED read-only — if it matches the trusted npm pattern
+    we invoke `node.exe + cli.js` directly with list-form argv (no shell). If
+    inspection fails we fall back to `%COMSPEC% /c <shim>` (comspec_cmd). Never
+    shell=True unproven against adversarial args; the node_script path is the
+    safe list-form path.
+
+    Returns a fresh dict per call (no shared mutable state). Raises RouterError
+    if no Claude is found or the explicit path is missing.
+    """
+    env = user_env if user_env is not None else os.environ
+    candidates = []
+    explicit = env.get("FRY_CLAUDE_BIN")
+    if explicit:
+        candidates.append(explicit)
+    path_env = env.get("PATH", "")
+    # shutil.which accepts a path arg; respects PATHEXT on Windows.
+    found = (shutil.which("claude", path=path_env)
+             or shutil.which("claude.cmd", path=path_env)
+             or shutil.which("claude.exe", path=path_env))
+    if found and os.path.abspath(found) not in [os.path.abspath(c) for c in candidates]:
+        candidates.append(found)
+    if not candidates:
+        raise RouterError("FRY_CLAUDE_ERROR stage=resolve reason=no_claude_found")
+    resolved = os.path.abspath(candidates[0])
+    if not os.path.exists(resolved):
+        raise RouterError("FRY_CLAUDE_ERROR stage=resolve reason=explicit_path_missing")
+    lower = resolved.lower()
+    if lower.endswith(".cmd") or lower.endswith(".bat"):
+        inspected = _inspect_cmd_shim(resolved)
+        if inspected:
+            node_path, script_path = inspected
+            return _fresh_spec(
+                argv_prefix=[node_path, script_path],
+                resolved_kind="node_script",
+                resolved_command_path=resolved,
+                node_path=node_path, script_path=script_path)
+        comspec = env.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+        return _fresh_spec(
+            argv_prefix=[comspec, "/c", resolved],
+            resolved_kind="comspec_cmd",
+            resolved_command_path=resolved)
+    # native executable (claude.exe or any real exe)
+    return _fresh_spec(
+        argv_prefix=[resolved],
+        resolved_kind="native_exe",
+        resolved_command_path=resolved)
 
 
 def _copy_env_for_sidecar(port: int, main_model: str, small_model: str,
@@ -122,9 +242,13 @@ def launch_via_sidecar(cfg, agent, model_spec, passthrough_args,
     port = None
     proc = None
     try:
+        # Resolve the Claude launcher BEFORE acquiring the sidecar lease, so a
+        # resolution failure leaves no lease to clean up and no orphan process.
+        # Resolution reads FRY_CLAUDE_BIN / PATH at launch time (no module cache).
+        spec = _resolve_claude_invocation()
         port, lease_id = mgr.acquire_lease(owner)
         env = _copy_env_for_sidecar(port, main_model, small_model)
-        argv = [CLAUDE_BIN] + list(passthrough_args or [])
+        argv = list(spec["argv_prefix"]) + list(passthrough_args or [])
         # Foreground, inherited stdio -> interactive terminal + Ctrl-C propagation.
         # We do NOT capture output; streaming + cancellation belong to Claude Code.
         proc = subprocess.Popen(argv, env=env, cwd=os.getcwd(),
@@ -135,6 +259,13 @@ def launch_via_sidecar(cfg, agent, model_spec, passthrough_args,
         # Propagate Ctrl-C to the child only (we are the foreground parent).
         rc = _wait_propagating(proc)
         return rc
+    except Exception:
+        # Structured, redacted error — never leak the raw exception (may carry
+        # tokens/paths). stage=resolve if no lease yet, else spawn.
+        stage = "resolve" if lease_id is None else "spawn"
+        print(f"FRY_SIDECAR_ERROR provider={raine_provider} stage={stage} "
+              f"reason=<redacted>", file=sys.stderr)
+        raise
     finally:
         if lease_id is not None:
             try:

@@ -1715,7 +1715,12 @@ def cmd_launch(cfg, args):
             _prov = args.model.split(",", 1)[0].strip()
         elif getattr(args, "provider", None):
             _prov = args.provider.strip()
-        if _prov in ("openai", "xai", "kimi"):
+        # Mirror fry_anthropic_router.RAINE_PROVIDERS keys: both the fry
+        # provider id (openai/xai/kimi) AND the raine provider name
+        # (codex/grok/kimi) route through the sidecar. Omitting codex/grok
+        # here would let `fry launch claude --model codex,...` fall through to
+        # the legacy flattening router — exactly the fallback we remove.
+        if _prov in ("openai", "xai", "kimi", "codex", "grok"):
             try:
                 rc = _sidecar_router.launch_via_sidecar(
                     cfg, args.agent, args.model, passthrough_global,
@@ -1725,11 +1730,19 @@ def cmd_launch(cfg, args):
             except KeyboardInterrupt:
                 _debug_finalize(130)
                 return 130
-            except Exception as e:
-                print(f"fry: sidecar launch failed for '{_prov}' ({e}); "
-                      f"falling back to legacy router path.", file=sys.stderr)
+            except Exception:
+                # NO legacy fallback. Subscription sidecar failure must not
+                # flatten to the legacy router path (that path historically
+                # mutated .claude.json/settings/CCR). Emit a structured,
+                # redacted FRY_SIDECAR_ERROR and return non-zero so it
+                # propagates to sys.exit. The per-launch sidecar lease is
+                # released inside launch_via_sidecar's finally (lease-aware).
+                print(f"FRY_SIDECAR_ERROR provider={_prov} stage=sidecar_launch "
+                      f"reason=<redacted>", file=sys.stderr)
+                _debug_finalize(3)
+                return 3
         # opencode via routatic: integrated but gated on ROUTATIC_PROXY_API_KEY.
-        # If absent, fall through to legacy and surface AUTH_ACTION_REQUIRED.
+        # If absent, surface AUTH_ACTION_REQUIRED + non-zero (no legacy launch).
         elif _prov == "opencode" and os.environ.get("ROUTATIC_PROXY_API_KEY"):
             try:
                 rc = _sidecar_router.launch_via_sidecar(
@@ -1737,14 +1750,21 @@ def cmd_launch(cfg, args):
                     dry_run=args.dry_run, provider="opencode")
                 _debug_finalize(rc)
                 return rc
-            except Exception as e:
-                print(f"fry: routatic sidecar launch failed ({e}); "
-                      f"falling back to legacy router path.", file=sys.stderr)
+            except KeyboardInterrupt:
+                _debug_finalize(130)
+                return 130
+            except Exception:
+                print(f"FRY_SIDECAR_ERROR provider=opencode stage=sidecar_launch "
+                      f"reason=<redacted>", file=sys.stderr)
+                _debug_finalize(3)
+                return 3
         elif _prov == "opencode" and not os.environ.get("ROUTATIC_PROXY_API_KEY"):
             print("fry: opencode via routatic sidecar requires ROUTATIC_PROXY_API_KEY "
-                  "(OpenCode Go API key). Set it to use the modernized path; "
-                  "falling back to legacy router for this launch. "
-                  "[AUTH_ACTION_REQUIRED for routatic live E2E]", file=sys.stderr)
+                  "(OpenCode Go API key). Set it to use the modernized path. "
+                  "[AUTH_ACTION_REQUIRED for routatic live E2E]",
+                  file=sys.stderr)
+            _debug_finalize(3)
+            return 3
 
     if mode == "router":
         rc = launch_router(cfg, args.agent, args.model, passthrough_global, args.dry_run)
