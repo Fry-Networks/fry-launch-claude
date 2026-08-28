@@ -55,7 +55,7 @@ launches the real Codex agent.
 
 ---
 
-## Install (FryStation / Windows)
+## Install (<internal-host> / Windows)
 
 1. `fry.py` + `config.example.json` → `%USERPROFILE%\.fry\`
 2. `copy %USERPROFILE%\.fry\config.example.json %USERPROFILE%\.fry\config.json`, then edit the `secret` fields (see Secrets).
@@ -160,7 +160,7 @@ Edit `config.json`:
 - **Codex `wire_api`:** the native OpenRouter→Codex block defaults to `wire_api="chat"`;
   some Codex builds want `responses`. Flip that one value if Codex errors.
 - **Codex + remote Ollama:** Codex honors only `localhost` for Ollama (upstream bug).
-  Fine on FryStation; won't reach ARES00's Ollama.
+  Fine on <internal-host>; won't reach <internal-host>'s Ollama.
 - **OpenRouter + Claude Code** is officially best-effort for non-Anthropic models
   (extended thinking / prompt caching may not pass through). Anthropic models via the
   Anthropic Skin behave normally.
